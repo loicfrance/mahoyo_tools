@@ -148,9 +148,11 @@ class CompressedBG :
         comp1 = BytesIO()
         pixels = pixels.flatten()
         cursor = 0
+        if pixels[cursor] == 0 :
+            write_variable(comp1, 0)
         while cursor < len(pixels) :
             i = cursor
-            if pixels[i] != 0 or i == 0 :
+            if pixels[i] != 0 :
                 while i < len(pixels) and pixels[i] > 0 :
                     i += 1
                 write_variable(comp1, i - cursor)
