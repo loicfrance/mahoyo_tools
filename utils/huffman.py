@@ -134,7 +134,7 @@ class HuffmanTable(ABC) :
             binary, size = node.encode()
             byte |= binary << shift
             shift += size
-            while byte > 0xFF :
+            while shift >= 8 :
                 output.write((byte & 0xFF).to_bytes(1))
                 byte >>= 8
                 shift -= 8
