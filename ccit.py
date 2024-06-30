@@ -17,7 +17,7 @@ class Glyph :
     @property
     def row(self) : return floor((self.index % 98) / 14)
     @property
-    def x(self) : return ceil(self.column * 73 + (73-self.width)/2),
+    def x(self) : return ceil(self.column * 73 + (73-self.width)/2)
     @property
     def y(self) : return self.row * 73
     @property
@@ -25,7 +25,7 @@ class Glyph :
 
     @property
     def ccit_char_index(self) :
-        return self.char.encode('utf-8').rjust(4, b'\x00') + \
+        return self.char.encode('utf-8').ljust(4, b'\x00') + \
                self.index.to_bytes(4, 'little')
     
     @property
@@ -63,10 +63,9 @@ class Font :
         reverse_swap = dict([(v, k) for k, v in swap_map.items()])
         
         for glyph in self.glyphs.values() :
-            if glyph.char in swap_map :
-                glyph.char = swap_map.get(glyph.char)
-            elif glyph.char in reverse_swap :
-                glyph.char = reverse_swap.get(glyph.char)
+            swap = swap_map.get(glyph.char) or reverse_swap.get(glyph.char)
+            if swap is not None :
+                glyph.char = swap
         self._refresh_glyphs()
     
     def string_width(self, text: str) -> int :
@@ -80,31 +79,31 @@ class Font :
         return total
     
     @overload
-    def to_ccit(self, dest: Optional[BytesIO] = None) -> BytesIO : ...
+    def to_ccit(self, dest: str | BytesIO) -> None : ...
     @overload
-    def to_ccit(self, dest: str) -> None : ...
+    def to_ccit(self, dest: None = None) -> BytesIO : ...
     
-    def to_ccit(self, dest: Union[BytesIO, str, None] = None) -> Optional[BytesIO] :
-        if isinstance(dest, str) :
-            file = open(dest, "wb")
-        elif dest is None :
-            file = BytesIO()
+    def to_ccit(self, dest: BytesIO | str | None = None) :
+        match dest :
+            case str() : file = open(dest, "wb")
+            case None : file = BytesIO()
+            case _ : file = dest
         file.write(struct.pack('<2I', len(self.glyphs), 8)) # 8 bytes for char and index
 
         for glyph in self.glyphs.values():
             file.write(glyph.ccit_char_index)
 
-        if self.use_coordinates > 2:
+        if self.use_coordinates :
             file.write(struct.pack('<2I', len(self.glyphs), 20)) # 20 bytes for coordinates
             for glyph in self.glyphs.values():
                 file.write(glyph.ccit_coords)
         else:
             file.write(0 .to_bytes(4, 'little'))
 
-        if isinstance(dest, str) :
-            file.close()
-        else :
-            return file
+        match dest :
+            case str() : file.close()
+            case None : return file
+            case _ : pass
     
     def to_txt(self) -> str :
         return "\n".join([g.txt_line for g in self.glyphs.values()])
