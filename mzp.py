@@ -3,11 +3,13 @@ from io import BufferedReader, BufferedWriter, BytesIO
 from math import ceil, floor
 import os
 import struct
-from typing import overload
+from typing import cast, overload
 import zlib
 
 import numpy as np
+from numpy.typing import NDArray
 
+from .utils.io import BytesReader, BytesWriter, save
 from .hep import hep_extract_tile
 
 MZP_FILE_MAGIC = b'mrgd00'
@@ -126,13 +128,14 @@ class MzpArchiveEntry :
             return self._data
 
     @data.setter
-    def data(self, data: bytes|BufferedReader) :
+    def data(self, data: bytes|BytesReader) :
         if not isinstance(data, bytes) :
+            assert not isinstance(data, (memoryview, bytearray))
             data = data.read()
         self._data = data
         self._size = len(self._data)
     
-    def to_archive(self, file: BufferedWriter, alignment: int = MZP_DEFAULT_ALIGNMENT) :
+    def to_archive(self, file: BytesWriter, alignment: int = MZP_DEFAULT_ALIGNMENT) :
         position = file.tell()
         file.seek(self.header_start)
         file.write(self.header)
@@ -142,30 +145,15 @@ class MzpArchiveEntry :
         file.seek(position)
     
     @overload
-    def to_file(self, file: str) -> None : ...
+    def to_file(self, dest: str | BytesIO) -> None : ...
     @overload
-    def to_file(self, file: BytesIO | None = None) -> BytesIO : ...
+    def to_file(self, dest: None = None) -> BytesIO : ...
 
-    def to_file(self, dest: BytesIO | str | None = None) -> BytesIO | None :
-        if dest is None :
-            return BytesIO(self.data)
-        elif isinstance(dest, str) :
-            os.makedirs(os.path.dirname(dest), exist_ok=True)
-            if os.path.isdir(os.path.abspath(dest)) :
-                dest = os.path.join(dest, f"{self.index}.bin")
-            file = open(dest, "rb+" if os.path.exists(dest) else "wb+")
-            file.write(self.data)
-            file.close()
-        else :
-            pos = dest.tell()
-            dest.write(self.data)
-            dest.seek(pos)
-            return dest
+    def to_file(self, dest: BytesWriter | str | None = None) -> BytesIO | None :
+        save(self.data, dest)
     
     def from_file(self, src: BufferedReader | str) :
         if isinstance(src, str) :
-            if os.path.isdir(os.path.abspath(src)) :
-                src = os.path.join(src, self.file_name)
             file = open(src, "rb")
             self.data = file.read()
             file.close()
@@ -179,14 +167,13 @@ class MzpArchiveEntry :
 
 class MzpArchive :
 
-    def __init__(self, file: str | bytes) -> None:
-        if isinstance(file, str) :
-            file = open(file, "rb+")
+    def __init__(self, src: str | bytes) -> None:
+        if isinstance(src, str) :
+            self._file = open(src, "rb+")
         else :
-            file = BytesIO(file)
-        self._file: BytesIO = file
+            self._file = BytesIO(src)
             
-        header = file.read(MZP_HEADER_SIZE)
+        header = self._file.read(MZP_HEADER_SIZE)
         assert header.startswith(MZP_FILE_MAGIC)
         nbEntries = int.from_bytes(header[-2:], "little", signed=False)
         
@@ -221,31 +208,31 @@ class MzpArchive :
                 offset += alignment - offset % alignment
     
     @overload
-    def mzp_write(self, dest: str,
+    def mzp_write(self, dest: BytesWriter | str,
                   alignment: int = MZP_DEFAULT_ALIGNMENT) -> None: ...
     @overload
-    def mzp_write(self, dest: BufferedWriter | None = None,
-                  alignment: int = MZP_DEFAULT_ALIGNMENT) -> BufferedWriter: ...
+    def mzp_write(self, dest: None = None,
+                  alignment: int = MZP_DEFAULT_ALIGNMENT) -> BytesIO: ...
 
-    def mzp_write(self, dest: str | BufferedWriter | None = None,
-                  alignment: int = MZP_DEFAULT_ALIGNMENT) -> BufferedWriter:
+    def mzp_write(self, dest: str | BytesWriter | None = None,
+                  alignment: int = MZP_DEFAULT_ALIGNMENT) :
         """Write the mzp archive to a file"""
-        if isinstance(dest, str) :
-            file = open(dest, "wb")
-        elif dest is None :
-            file = BytesIO()
-        else :
-            file = dest
+        match dest :
+            case str() :
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                file = open(dest, "wb")
+            case None : file = BytesIO()
+            case _ : file = dest
         self.update_offsets(alignment)
         file.write(self.header)
         for entry in self :
             entry.to_archive(file, alignment)
         
-        if isinstance(dest, str) :
-            file.close()
-        else :
-            file.seek(0)
-            return file
+        match dest :
+            case str() : cast(BufferedWriter, file).close()
+            case None :
+                file.seek(0)
+                return file
 
 class MzpImage(MzpArchive) :
 
@@ -315,9 +302,9 @@ class MzpImage(MzpArchive) :
             return hep_extract_tile(self, index)
         match self.bits_per_px :
             case 4 :
-                tile_data: bytes = sum([
+                tile_data: bytes = b''.join([
                     struct.pack('BB', octet & 0x0F, octet >> 4)
-                    for octet in tile_file
+                    for octet in tile_file.read()
                 ])
             case 24 | 32 as bpp: # RGB/RGBA true color for 0x08 and 0x0B bmp type
                 assert self.bmp_type in [0x08, 0x0B]
@@ -325,10 +312,10 @@ class MzpImage(MzpArchive) :
                 buffer = tile_file.read()
                 rgb565 = np.frombuffer(buffer, dtype='<u2', count=self.tile_size)
                 offsets = np.frombuffer(buffer, dtype=np.uint8, offset = self.tile_size*2, count = self.tile_size)
-                colors: np.ndarray = np_rgb565_parse(rgb565, offsets)
+                colors: NDArray[np.uint8] = np_rgb565_parse(rgb565, offsets)
                 if bpp == 32 :
-                    alpha = np.frombuffer(buffer, dtype=np.uint8, offset = self.tile_size*3, count = self.tile_size)
-                    colors = np.hstack(colors, alpha)
+                    alpha: NDArray[np.uint8] = np.frombuffer(buffer, dtype=np.uint8, offset = self.tile_size*3, count = self.tile_size)
+                    colors = np.hstack((colors, alpha))
                 tile_data = colors.tobytes()
             case 8 :
                 tile_data = tile_file.read()
@@ -383,6 +370,7 @@ class MzpImage(MzpArchive) :
                 chunk = struct.pack(">IIBB", width, height, 8, 3) + b'\0\0\0' # 8bpp (PLTE)
                 write_pngchunk_withcrc(file, b'IHDR', chunk)
                 palette = self.get_palette()
+                assert palette is not None
                 plte = palette[:, :3].tobytes()# b''.join([struct.pack('BBB', r, g, b) for (r, g, b, a) in palette])
                 trns = palette[:, 3].tobytes()# b''.join([struct.pack('B', a) for (r, g, b, a) in palette])
                 write_pngchunk_withcrc(file, b'PLTE', plte)
@@ -411,7 +399,7 @@ class MzpImage(MzpArchive) :
     def img_read(self, src: str |BufferedReader | None = None) :
         pass
 
-def write_pngchunk_withcrc(file: BufferedWriter, data_type: bytes, data: bytes):
+def write_pngchunk_withcrc(file: BytesWriter, data_type: bytes, data: bytes):
     file.write(struct.pack(">I", len(data)))
     file.write(data_type)
     file.write(data)

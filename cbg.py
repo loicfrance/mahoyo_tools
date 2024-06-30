@@ -1,12 +1,14 @@
 
-from io import BufferedReader, BufferedWriter, BytesIO
+from io import BufferedWriter, BytesIO
 from PIL import Image
 from math import ceil
 import struct
-from typing import overload
+from typing import Any, cast, overload, TYPE_CHECKING
 import numpy as np
 
+from .utils.io import BytesReader, BytesWriter, BytesRW
 from .utils.huffman import ByteHuffmanTable
+from .utils.bitstream import BitStreamReader, BitStreamWriter
 
 __all__ = [
     "CompressedBG"
@@ -14,7 +16,7 @@ __all__ = [
 
 CBG_MAGIC = b'CompressedBG_MT\0'
 
-def read_variable(src: BufferedReader) :
+def read_variable(src: BytesReader) :
     value = 0
     shift = 0
     byte = 0xFF
@@ -24,7 +26,7 @@ def read_variable(src: BufferedReader) :
         shift += 7
     return value
 
-def write_variable(dest: BufferedWriter, value: int) :
+def write_variable(dest: BytesWriter, value: int) :
     
     while value > 0x7F :
         byte = (value & 0x7F) | 0x80
@@ -35,12 +37,11 @@ def write_variable(dest: BufferedWriter, value: int) :
 
 class CompressedBG :
     
-    def __init__(self, src: str | bytes) -> None:
-        if isinstance(src, str) :
-            file = open(src, "rb+")
-        else :
-            file = BytesIO(src)
-        self._file: BytesIO = file
+    def __init__(self, src: str | bytes | BytesRW) -> None:
+        match src :
+            case str() : self._file = open(src, "rb+")
+            case bytes() : self._file = BytesIO(src)
+            case _ : self._file = cast(BytesRW, src)
         
         assert self._file.read(len(CBG_MAGIC)) == CBG_MAGIC
         
@@ -57,7 +58,7 @@ class CompressedBG :
         # get list of section offsets
         offsets = np.frombuffer(self._file.read(self._nb_stripes*4), dtype="<u4")
         sizes = np.diff(offsets, append=self._file.seek(0, 2))
-        self._stripes:list[tuple[int]] = list(map(tuple, np.column_stack((offsets, sizes))))
+        self._stripes: list[tuple[int, int]] = list(map(tuple, np.column_stack((offsets, sizes))))
     
     def _stripe_height(self, index: int) :
         if index < self._nb_stripes -1 :
@@ -83,10 +84,18 @@ class CompressedBG :
         # 1.2. extract Huffman table
         huffTable = ByteHuffmanTable()
         for i in range(0, 256) :
-            huffTable[i].weight = read_variable(self._file)
-        huffTable.createHierarchy(511)
+            huffTable.getNode(i).weight = read_variable(self._file)
+        huffTable.buildTree(511)
+
         # 1.3. decompress content
-        huffOutput = huffTable.decompress(self._file, huffOutputSize)
+        bitStream = BitStreamReader(self._file)
+        huffOutput = BytesIO()
+        huffOutput.truncate(huffOutputSize)
+        huffOutput.seek(0)
+        for _ in range(0, huffOutputSize) :
+            value = huffTable.decodeSequence(bitStream)
+            huffOutput.write(value.to_bytes(1))
+        huffOutput.seek(0)
         assert self._file.tell() == offset + size
 
         # 2. Alternate between filling 0 and copying data from huffman output
@@ -121,7 +130,7 @@ class CompressedBG :
         # TODO check if output file is updated
         return output
     
-    def _compress_stripe(self, buffer: np.ndarray[np.uint8], index: int) :
+    def _compress_stripe(self, buffer: np.ndarray[Any, np.dtype[np.uint8]], index: int) :
         width = self._width
         height = self._stripe_height(index)
         row_start = index * self._stripe_h
@@ -170,24 +179,28 @@ class CompressedBG :
 
         huffTable = ByteHuffmanTable()
         while byte := comp1.read(1) :
-            huffTable[byte[0]].weight += 1
+            huffTable.getNode(byte[0]).weight += 1
         comp1.seek(0)
         for node in huffTable :
             write_variable(output, node.weight)
 
-        huffTable.createHierarchy(511)
-        output.write(huffTable.compress(comp1, decomp_size).getbuffer())
+        huffTable.buildTree(511)
+        
+        bitStream = BitStreamWriter(output)
+        while comp1.tell() < decomp_size :
+            huffTable.encodeValue(bitStream, comp1.read(1)[0])
+        bitStream.flush()
+        output.seek(0)
         return output
 
     @overload
     def img_write(self, dest: str) -> None : ...
     @overload
-    def img_write(self, dest: BufferedWriter | None = None,
-                  format: str = "raw") -> BufferedWriter : ...
-    def img_write(self, dest: str | BufferedWriter | None = None,
+    def img_write(self, dest: BytesWriter, format: str = "raw") -> None : ...
+    @overload
+    def img_write(self, dest: None = None, format: str = "raw") -> BytesIO : ...
+    def img_write(self, dest: str | BytesWriter | None = None,
                   format: str = "raw") :
-        if dest is None :
-            dest = BytesIO()
 
         raw_pixels_file = BytesIO()
         for index in range(0, self._nb_stripes) :
@@ -199,12 +212,15 @@ class CompressedBG :
             case 24 : mode = "RGB"
             case 32 : mode = "RGBA"
         image = Image.frombytes(mode, (self._width, self._height), raw_pixels_file.getbuffer())
-        image.save(dest, format)
-        
-        if not isinstance(dest, str) :
+
+        if dest is None :
+            dest = BytesIO()
+            image.save(dest, format)
             return dest
+        else :
+            image.save(dest, format)
     
-    def img_read(self, src: str | BufferedReader | Image.Image) :
+    def img_read(self, src: str | BytesReader | bytes | Image.Image) :
         if not isinstance(src, Image.Image) :
             src = Image.open(src)
         assert src.width == self._width
@@ -228,17 +244,13 @@ class CompressedBG :
         self._file.seek(48)
         self._file.write(struct.pack(f"<{len(offsets)}I", *tuple(offsets)))
 
-    def cbg_write(self, dest: str | BufferedWriter | None = None) :
-        if dest is None :
-            output = BytesIO()
-        elif isinstance(dest, str) :
-            output = open(dest, "wb")
-        else :
-            output = dest
-
-        output.write(self._file.getbuffer())
-
-        if isinstance(dest, str) :
-            output.close()
-        else :
-            return output
+    def cbg_write(self, dest: str | BytesWriter | None = None) :
+        match dest :
+            case None :
+                return BytesIO(self._file.read())
+            case str() :
+                output = open(dest, "wb")
+                output.write(self._file.read())
+                output.close()
+            case _ :
+                dest.write(self._file.read())

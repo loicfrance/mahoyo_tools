@@ -1,9 +1,10 @@
 
 
-from io import BufferedReader, BytesIO
+from io import BufferedRandom, BufferedReader, BytesIO
 from math import ceil
-from typing import Optional, Union, overload
+from typing import Optional, Union, cast, overload
 
+from .utils.io import BytesRW, BytesReader, BytesWriter
 
 MZX_FILE_MAGIC = b"MZX0"
 
@@ -73,16 +74,16 @@ def mzx_compress(input_file: BufferedReader, output_file: Optional[BytesIO] = No
     return output_file
 
 @overload
-def mzx_decompress(src: Union[BufferedReader, str], dest: str,
+def mzx_decompress(src: BytesReader | str, dest: BytesRW | str,
                    invert_bytes: bool = False) -> None : ...
 
 @overload
-def mzx_decompress(src: Union[BufferedReader, str],
-                   dest: Optional[BytesIO] = None,
+def mzx_decompress(src: Union[BytesReader, str],
+                   dest: None = None,
                    invert_bytes: bool = False) -> BytesIO : ...
 
-def mzx_decompress(src: Union[BufferedReader, str],
-                   dest: Union[BytesIO, str, None] = None,
+def mzx_decompress(src: BytesReader | str,
+                   dest: BytesRW | str | None = None,
                    invert_bytes: bool = False) :
     input_file = open(src, 'rb') if isinstance(src, str) else src
     match dest :
@@ -146,7 +147,7 @@ def mzx_decompress(src: Union[BufferedReader, str],
             case _ : # 3: LITERAL
                 buffer = input_file.read((arg+1)*2)
                 if invert_bytes :
-                    buffer = [b ^ 0xFF for b in buffer]
+                    buffer = bytes([b ^ 0xFF for b in buffer])
                 output_file.write(buffer)
                 ring_buf.append(buffer)
         
@@ -156,6 +157,6 @@ def mzx_decompress(src: Union[BufferedReader, str],
     output_file.seek(0)
     input_file.seek(start)
 
-    if isinstance(src, str) : input_file.close()
-    if isinstance(dest, str) : output_file.close()
-    else : return output_file
+    if isinstance(src, str) : cast(BufferedReader, input_file).close()
+    if isinstance(dest, str) : cast(BufferedRandom, output_file).close()
+    elif dest is None : return output_file
