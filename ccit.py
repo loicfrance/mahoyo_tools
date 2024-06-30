@@ -100,7 +100,7 @@ class Font :
                 file.write(glyph.ccit_coords)
         else:
             file.write(0 .to_bytes(4, 'little'))
-
+        file.seek(0)
         match dest :
             case str() : file.close()
             case None : return file
