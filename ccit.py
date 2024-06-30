@@ -25,8 +25,9 @@ class Glyph :
 
     @property
     def ccit_char_index(self) :
-        return self.char.encode('utf-8').ljust(4, b'\x00') + \
-               self.index.to_bytes(4, 'little')
+        return struct.pack("<2I",
+            int.from_bytes(self.char.encode('utf-8'), 'big'),
+            self.index)
     
     @property
     def ccit_coords(self) :
