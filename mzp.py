@@ -150,7 +150,7 @@ class MzpArchiveEntry :
     def to_file(self, dest: None = None) -> BytesIO : ...
 
     def to_file(self, dest: BytesWriter | str | None = None) -> BytesIO | None :
-        save(self.data, dest)
+        return save(self.data, dest)
     
     def from_file(self, src: BufferedReader | str) :
         if isinstance(src, str) :
@@ -236,8 +236,8 @@ class MzpArchive :
 
 class MzpImage(MzpArchive) :
 
-    def __init__(self, file: str | bytes) -> None:
-        super().__init__(file)
+    def __init__(self, src: str | bytes) -> None:
+        super().__init__(src)
         self.update_img_info()
     
     def update_img_info(self) :
@@ -324,11 +324,11 @@ class MzpImage(MzpArchive) :
         return tile_data
 
     @overload
-    def img_write(self, dest: str) -> None: ...
+    def img_write(self, dest: BytesWriter | str) -> None: ...
     @overload
-    def img_write(self, dest: BufferedWriter | None = None) -> BytesIO: ...
+    def img_write(self, dest: None = None) -> BytesIO: ...
 
-    def img_write(self, dest: str | BufferedWriter | None = None) :
+    def img_write(self, dest: str | BytesWriter | None = None) :
         
         rows = [b''] * (self.height - self.tile_y_count * self.tile_crop)
         for y in range(self.tile_y_count) :
@@ -351,15 +351,13 @@ class MzpImage(MzpArchive) :
                     end = len(temp_row) - self.tile_crop * self.bytes_per_px
                     rows[start_row + i] += temp_row[start:end]
         
-        if isinstance(dest, str) :
-            assert dest.lower().endswith(".png")
-            file = open(dest, "wb")
-        elif dest is None :
-            file = BytesIO()
-            file_start = 0
-        else :
-            file = dest
-            file_start = file.tell()
+        match dest :
+            case str() :
+                assert dest.lower().endswith(".png")
+                file = open(dest, "wb")
+            case None : file = BytesIO()
+            case _ : file = dest
+        
         # PNG SIG
         file.write(b'\x89PNG\x0D\x0A\x1A\x0A')
 
@@ -390,14 +388,16 @@ class MzpImage(MzpArchive) :
         write_pngchunk_withcrc(file, b"IDAT", zlib.compress(data))
         write_pngchunk_withcrc(file, b"IEND", b'')
         
-        if isinstance(dest, str) :
-            file.close()
-        else :
-            file.seek(file_start)
-            return file
+        match dest :
+            case str() : cast(BufferedWriter, file).close()
+            case None :
+                file.seek(0)
+                return file
+            case _ :
+                pass
    
     def img_read(self, src: str |BufferedReader | None = None) :
-        pass
+        raise NotImplementedError("image injection to mzp not implemented yet")
 
 def write_pngchunk_withcrc(file: BytesWriter, data_type: bytes, data: bytes):
     file.write(struct.pack(">I", len(data)))
