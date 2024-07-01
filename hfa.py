@@ -6,9 +6,9 @@ from __future__ import annotations
 from io import BufferedRandom, BufferedReader, BufferedWriter, BytesIO
 import os
 import struct
-from typing import Literal, Optional, Self, Union, cast, overload, TYPE_CHECKING
+from typing import Literal, Self, cast, overload, TYPE_CHECKING
 
-
+from .mzp import MzpImage
 from .lenzu import lenzu_decompress
 from .cbg import CompressedBG
 from .utils.io import BytesReader, BytesRW, BytesWriter
@@ -84,6 +84,7 @@ class _HfaEntry :
     
     @property
     def data(self) -> bytes :
+        """Raw data bytes of the entry"""
         match self._data :
             case None :
                 pos = self.tell()
@@ -118,14 +119,15 @@ class _HfaEntry :
 #- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
     def read(self, size: int|None = None, /) -> bytes :
-        """Get the HFA entry bytes data bytes
+        """Read bytes from the entry as a file
         
-        If data is stored in the object, return the stored data.
-        Otherwise, extract the data bytes from the file, and return it.
-        Use `write()`, `loadData()` or `from_file()` methods, or set the \
-        `data` attribute to store data bytes in the entry.
-
-        :return: the entry data bytes
+        If the size if not specified, the remaining bytes to the end of the
+        entry are returned.
+        An internal cursor is used to keep track of where the last read / write
+        instruction ended, and start the new one at this position.
+        :param size: number of bytes to read. None or unspecified to read all \
+                     remaining bytes
+        :return: the bytes read from the entry
         """
         if isinstance(self._data, BytesIO) :
             data = self._data.read(size)
@@ -148,6 +150,13 @@ class _HfaEntry :
         return data
 
     def write(self, data: 'ReadableBuffer', /) -> int :
+        """Write bytes to the entry as a file
+        
+        An internal cursor is used to keep track of where the last read / write
+        instruction ended, and start the new one at this position.
+        :param data: buffer containing the data bytes to write
+        :return: number of bytes written to the entry
+        """
         if not isinstance(self._data, BytesIO) :
             self._data = BytesIO(self.data)
             self._data.seek(self._cursor)
@@ -158,6 +167,17 @@ class _HfaEntry :
         return result
     
     def truncate(self, size: int | None = None, /) -> int:
+        """Change the size of the entry
+        
+        If the size is lower than the current size, the extra bytes are removed.
+        If the size is greater than the current size, 0x00 bytes are appended.
+        If the size is not specified, the content is cut at the current \
+        internal cursor location (where the last read/write instruction \
+        stopped).
+        :param size: new desired size of the entry. None or unspecified to cut \
+            at the current position
+        :return: the new entry size
+        """
         if size is None :
             size = self._cursor
         if size > self._size :
@@ -175,9 +195,23 @@ class _HfaEntry :
         return size
     
     def tell(self) :
+        """Get the current internal cursor position in the entry data
+        
+        This cursor is where the last read/write instruction
+        stopped.
+        :return: the internal cursor position"""
         return self._cursor
     
     def seek(self, offset: int, whence: int = 0, /) -> int :
+        """Change the position of the internal cursor
+        
+        :param offset: position of the cursor, relative to the start, current \
+            position or end depending on the whence parameter
+        :param whence: `0` to position the cursor relative to the start, \
+            `1` to position the cursor relative to the current position, and \
+            `2` to position the cursor relative to the end; Defaults to `0`
+        :return: new cursor position relative to the start
+        """
         size = self.size
         match self._data :
             case bytes() | None :
@@ -205,13 +239,13 @@ class _HfaEntry :
     
     @overload
     def to_file(self, dest: str | BytesWriter) -> None :
-        """Write the entry data to the specified file
+        """Write the raw entry data to the specified file
         
         :param dest: destination file path or writer
         """
     @overload
     def to_file(self, dest: None = None) -> BytesIO :
-        """Write the entry data to a file
+        """Write the rawentry data to a file
         
         :return: a file containing a copy of the entry data
         """
@@ -246,24 +280,60 @@ class _HfaEntry :
             self.data = src
     
     @overload
-    def extract(self, dest: str | BytesRW, *args, **kwargs) -> None : ...
+    def extract(self, dest: str | BytesRW, *args, **kwargs) -> None :
+        """Extract the content of the entry to the specified location.
+        
+        If the destination is file path that has the same extension \
+        as the entry, the raw data is inserted at the specified location.
+        Otherwise, the file content is decompressed (if possible) and copied \
+        into the destination file.
+
+        :param dest: destination file path or writable file-like object
+        :param args: additional arguments for the decompression
+        :param kwargs: additional arguments for the decompression
+        """
     @overload
-    def extract(self, dest: None = None, *args, **kwargs) -> BytesIO : ...
+    def extract(self, dest: None = None, *args, **kwargs) -> BytesIO :
+        """Extract the content of the entry and store it in a `BytesIO` object
+
+        The file content is decompressed (if possible) and copied \
+        into the created `BytesIO` object.
+
+        :param args: additional arguments for the decompression
+        :param kwargs: additional arguments for the decompression
+        """
 
     def extract(self, dest: str | BytesRW | None = None, *args, **kwargs) :
         extension_index = self._file_name.rindex('.')
         extension = self._file_name[extension_index+1:]
         self.seek(0)
-        match extension :
-            case 'cbg' : return CompressedBG(self).img_write(dest, *args, **kwargs)
-            case 'ctd' :
-                lenzu_header = self.read(16)
-                self.seek(0)
-                if lenzu_header == b"LenZuCompressor\0" :
-                    return lenzu_decompress(self, self.size, dest)
-                return self.to_file(dest)
-    
+        if isinstance(dest, str) and  dest[dest.rfind('.')+1:] == extension :
+            self.to_file(dest)
+        else :
+            match extension :
+                case 'cbg' :
+                    cbg = CompressedBG(self)
+                    return cbg.img_write(dest, *args, **kwargs)
+                case 'ctd' :
+                    lenzu_header = self.read(16)
+                    self.seek(0)
+                    if lenzu_header == b"LenZuCompressor\0" :
+                        return lenzu_decompress(self, self.size, dest)
+                    return self.to_file(dest)
+                case 'mzp' :
+                    mzpImg = MzpImage(self.data)
+                    return mzpImg.img_write(dest)
+                case 'mp4' | 'chs' | 'ccit' | 'hw' :
+                    return self.to_file(dest)
+
     def inject(self, src: str | BytesReader | bytes) :
+        """Inject a new content to the entry
+        
+        If the source is a file path that has the same extension as the entry, \
+        the raw bytes are read from the file and inserted in the entry.
+        Otherwise, the source file content is compressed (if possible) and \
+        copied to the entry.
+        """
         if not isinstance(self._data, BytesIO) :
             self.loadData()
         extension_index = self._file_name.rindex('.')
@@ -272,11 +342,13 @@ class _HfaEntry :
         match extension :
             case 'cbg' :
                 CompressedBG(self).img_read(src)
-            case 'ctd' :
+            case 'ctd' | 'mp4' | 'chs' | 'ccit' | 'hw' :
                 if isinstance(src, str) :
                     self.from_file(src)
                 else :
                     self.data = src
+            case 'mzp' :
+                raise NotImplementedError("MZP compression not implemented")
     
 #endregion #####################################################################
 #region                            HFA ARCHIVE
@@ -289,6 +361,12 @@ class HfaArchive :
     _entries: dict[str, _HfaEntry]
 
     def __init__(self, path: str, mode: Literal['r', 'rw'] = 'r') -> None:
+        """HFA archive object
+        
+        :param path: path to the `.hfa` file to read
+        :param mode: 'rw' to replace the file content when caling `close()` , \
+            'r' (default) otherwise
+        """
         self._path = path
         self._file = None
         self._mode: Literal['r', 'rw'] = mode
@@ -371,7 +449,11 @@ class HfaArchive :
             self._entries[key] = e
 
     def close(self) :
-        """Close the archive file, and clear all entries"""
+        """Close the archive file, and clear all entries
+        
+        If the archive is opened in `rw` mode, the original file content is \
+        replaced with the new content.
+        """
         if self._file is not None :
             if self.mode == "rw" :
                 self.hfa_write()
@@ -379,7 +461,7 @@ class HfaArchive :
             self._file = None
             self._entries = {}
 
-    def hfa_write(self, dest: Union[BufferedWriter, str, None] = None,
+    def hfa_write(self, dest: BufferedWriter | str | None = None,
                   align_size: int = 0, align_byte: int = 0x00) :
         """Write the hfa content to the original file, or to the specified file
         
