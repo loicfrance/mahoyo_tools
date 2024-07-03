@@ -250,6 +250,7 @@ class _HfaEntry :
         :return: a file containing a copy of the entry data
         """
     def to_file(self, dest: BytesWriter | str | None = None):
+        self.seek(0)
         match dest :
             case None :
                 return BytesIO(self.read())
@@ -334,7 +335,7 @@ class _HfaEntry :
         Otherwise, the source file content is compressed (if possible) and \
         copied to the entry.
         """
-        if not isinstance(self._data, BytesIO) :
+        if self._data is None :
             self.loadData()
         extension_index = self._file_name.rindex('.')
         extension = self._file_name[extension_index+1:]
@@ -487,7 +488,8 @@ class HfaArchive :
         offset = 0
         for entry in self :
             if entry._data_offset != offset :
-                entry.loadData()
+                if entry._data is None :
+                    entry.loadData()
                 entry._data_offset = offset
             file.write(entry.header)
             offset += entry.size
@@ -505,4 +507,4 @@ class HfaArchive :
                     file.write(align_byte.to_bytes(1)*padding)
             else :
                 assert pos == start
-            file.write(entry.read())
+            entry.to_file(file)

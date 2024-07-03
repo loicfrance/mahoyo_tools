@@ -96,7 +96,8 @@ class CompressedBG :
             value = huffTable.decodeSequence(bitStream)
             huffOutput.write(value.to_bytes(1))
         huffOutput.seek(0)
-        assert self._file.tell() == offset + size
+        assert self._file.tell() == offset + size, \
+            f"{index}: {self._file.tell()} != {offset} + {size}"
 
         # 2. Alternate between filling 0 and copying data from huffman output
         output = BytesIO()
@@ -196,11 +197,11 @@ class CompressedBG :
     @overload
     def img_write(self, dest: str) -> None : ...
     @overload
-    def img_write(self, dest: BytesWriter, format: str = "raw") -> None : ...
+    def img_write(self, dest: BytesWriter, format: str = "png") -> None : ...
     @overload
-    def img_write(self, dest: None = None, format: str = "raw") -> BytesIO : ...
+    def img_write(self, dest: None = None, format: str = "png") -> BytesIO : ...
     def img_write(self, dest: str | BytesWriter | None = None,
-                  format: str = "raw") :
+                  format: str = "png") :
 
         raw_pixels_file = BytesIO()
         for index in range(0, self._nb_stripes) :
@@ -241,10 +242,18 @@ class CompressedBG :
             self._stripes[i] = (offset, size)
             if i < len(offsets)-1 :
                 offsets[i+1] = offset + size
+            else :
+                total_size = offset + size
         self._file.seek(48)
         self._file.write(struct.pack(f"<{len(offsets)}I", *tuple(offsets)))
+        self._file.truncate(total_size)
 
+    @overload
+    def cbg_write(self, dest: str | BytesWriter) -> None : ...
+    @overload
+    def cbg_write(self, dest: None = None) -> BytesIO : ...
     def cbg_write(self, dest: str | BytesWriter | None = None) :
+        self._file.seek(0)
         match dest :
             case None :
                 return BytesIO(self._file.read())

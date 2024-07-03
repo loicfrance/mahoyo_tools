@@ -106,6 +106,7 @@ class BitStreamWriter :
             self._shift %= 8
     
     def flush(self) :
-        self._file.write(self._curr_byte.to_bytes(1))
-        self._shift = 0
-        self._curr_byte = 0
+        if self._shift != 0:
+            self._file.write(self._curr_byte.to_bytes(1))
+            self._shift = 0
+            self._curr_byte = 0
