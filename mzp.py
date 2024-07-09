@@ -5,12 +5,13 @@ import os
 import struct
 from typing import cast, overload
 import zlib
-
+from PIL import Image, ImagePalette
 import numpy as np
 from numpy.typing import NDArray
 
-from .utils.io import BytesReader, BytesWriter, save
+from .mzx import mzx_compress, mzx_decompress
 from .hep import hep_extract_tile
+from .utils.io import BytesReader, BytesWriter, save
 
 MZP_FILE_MAGIC = b'mrgd00'
 MZP_HEADER_SIZE = len(MZP_FILE_MAGIC) + 2
@@ -19,19 +20,34 @@ MZP_DEFAULT_ALIGNMENT = 8
 
 MZP_SECTOR_SIZE = 0x800
 
-def rgb565_parse(pq: np.uint16, offsets_byte: np.uint8) :
+def rgb565_unpack(pq: np.uint16, offsets_byte: np.uint8) :
     r = ((pq & 0xF800) >> 8) + (offsets_byte >> 5)
     g = ((pq & 0x07E0) >> 3) + ((offsets_byte >> 3) & 0x03)
     b = ((pq & 0x001F) << 3) + (offsets_byte & 0x7)
     return np.array([r, g, b], dtype=np.uint8)
-np_rgb565_parse = np.vectorize(rgb565_parse)
+np_rgb565_unpack = np.vectorize(rgb565_unpack)
 
-def fix_alpha(a) :
+def rgb565_pack(r: np.uint8, g: np.uint8, b: np.uint8) :
+    offset = ((r & 0x07) << 5) \
+           | ((g & 0x03) << 3) \
+           | ((b & 0x07))
+    pq = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | ((b & 0xF8) >> 3)
+    return np.array([pq, offset], dtype="<u2")
+np_rgb565_pack = np.vectorize(rgb565_pack)
+
+def fix_alpha(a: np.uint8) :
     if a & 0x80 == 0 :
         return np.uint8(((a << 1) | (a >> 6)) & 0xFF)
     else :
         return np.uint8(0xFF)
 np_fix_alpha = np.vectorize(fix_alpha)
+
+def unfix_alpha(a: np.uint8) :
+    if a == 0xFF :
+        return a
+    else :
+        return np.uint8(a >> 1)
+np_unfix_alpha = np.vectorize(unfix_alpha)
 
 class MzpArchiveEntry :
 
@@ -152,7 +168,7 @@ class MzpArchiveEntry :
     def to_file(self, dest: BytesWriter | str | None = None) -> BytesIO | None :
         return save(self.data, dest)
     
-    def from_file(self, src: BufferedReader | str) :
+    def from_file(self, src: BytesReader | str) :
         if isinstance(src, str) :
             file = open(src, "rb")
             self.data = file.read()
@@ -249,6 +265,16 @@ class MzpImage(MzpArchive) :
     def tile_size(self) : return self.tile_width * self.tile_height
 
     @property
+    def nb_channels(self) :
+        match self.bmp_type, self.bits_per_px :
+            case 0x01, 4|8 : return 1
+            case 0x0C, bpp : return 4
+            case t   , 24  : return 3
+            case t   , 32  : return 4
+            case t, bpp : raise ValueError(
+                f"Unexpected bmp type - bpp pair 0x{t:02x}, {bpp}")
+
+    @property
     def bits_per_px(self) :
         match (self.bmp_type, self.bmp_depth) :
             case (0x01, 0x00|0x10) : return 4
@@ -273,9 +299,9 @@ class MzpImage(MzpArchive) :
         match (self.bmp_type, self.bmp_depth) :
             case (0x01, 0x00|0x10) : palette_size = 16
             case (0x01, 0x01|0x11|0x91) : palette_size = 256
-            case (0x01, d) :
-                raise ValueError(f"Unknown depth 0x{d:02X}")
-            case (t, d) : # type != 0x01
+            case (0x01, unknown_depth) :
+                raise ValueError(f"Unknown depth 0x{unknown_depth:02X}")
+            case (t, d) : # type != 0x01 (no palette)
                 return None
         
         palette = np.frombuffer(self[0].data, dtype = np.uint8, offset = 16,
@@ -294,34 +320,112 @@ class MzpImage(MzpArchive) :
         filler = np.repeat(np.array([[0,0,0,255]], dtype=np.uint8), 256 - palette_size, axis=0)
 
         return np.vstack((palette, filler), dtype=np.uint8)
+    
+    def set_palette(self, palette: np.ndarray | ImagePalette.ImagePalette) :
+        match (self.bmp_type, self.bmp_depth) :
+            case (0x01, 0x00|0x10) : palette_size = 16
+            case (0x01, 0x01|0x11|0x91) : palette_size = 256
+            case (0x01, unknown_depth) :
+                raise ValueError(f"Unknown depth 0x{unknown_depth:02X}")
+            case (t, d) : # type != 0x01 (no palette)
+                return
+        
+        if isinstance(palette, ImagePalette.ImagePalette) :
+            mode = palette.mode
+            palette = np.fromiter(palette.palette, dtype=np.uint8)
+            match mode :
+                case "RGB" :
+                    palette_size = palette.size // 3
+                    palette.shape = (palette_size, 3)
+                    alpha = np.frombuffer(b'\xFF'*palette_size, dtype=np.uint8)
+                    alpha.shape = (palette_size, 1)
+                    palette = np.hstack((palette, alpha))
+                case "RGBA" :
+                    palette.shape = (palette.size // 4, 4)
+                case "L" :
+                    palette.shape = (palette.size, 1)
+                    alpha = np.frombuffer(b'\xFF'*palette.size, dtype=np.uint8)
+                    palette = np.hstack((palette, palette, palette, alpha))
+                case _ :
+                    raise NotImplementedError(f"Unexpected palette mode {mode}")
+        else :
+            palette.shape = (palette.size, 4)
+        palette = np.hstack((palette[:, :3], np_unfix_alpha(palette[:, 3:])), dtype=np.uint8)
 
-    def get_tile(self, index: int) :
-        from .mzx import mzx_decompress
+        if self.bmp_depth in [0x11, 0x91] :
+            # swap palette blocks
+            for i in range(0, len(palette), 32) :
+                block1 = palette[i+8:i+16].copy()
+                palette[i+8:i+16] = palette[i+16:i+24]
+                palette[i+16:i+24] = block1
+        self[0].data = self[0].data[0:16] + palette.tobytes()
+
+    def get_tile(self, index: int) -> np.ndarray :
         tile_file = mzx_decompress(self[index+1].to_file())
         if self.bmp_type == 0x0C :
-            return hep_extract_tile(self, index)
+            return hep_extract_tile(self, index).flatten()\
+                .reshape((self.tile_height, self.tile_width, 4))
         match self.bits_per_px :
             case 4 :
-                tile_data: bytes = b''.join([
-                    struct.pack('BB', octet & 0x0F, octet >> 4)
-                    for octet in tile_file.read()
-                ])
+                buffer = np.frombuffer(tile_file.getbuffer(), dtype=np.uint8)
+                buffer.shape = (buffer.size, 1)
+                buffer = np.hstack((buffer & 0x0F, buffer >> 4)).flatten()
+                return buffer.reshape((self.tile_height, self.tile_width, 1))
+            case 8 :
+                buffer = np.frombuffer(tile_file.getbuffer(), dtype=np.uint8)
+                buffer.shape = (self.tile_height, self.tile_width, 1)
+                #buffer = buffer[:, :, :1]
+                return buffer
             case 24 | 32 as bpp: # RGB/RGBA true color for 0x08 and 0x0B bmp type
                 assert self.bmp_type in [0x08, 0x0B]
-                tile_data = b''
                 buffer = tile_file.read()
                 rgb565 = np.frombuffer(buffer, dtype='<u2', count=self.tile_size)
                 offsets = np.frombuffer(buffer, dtype=np.uint8, offset = self.tile_size*2, count = self.tile_size)
-                colors: NDArray[np.uint8] = np_rgb565_parse(rgb565, offsets)
+                pixels: NDArray[np.uint8] = np_rgb565_unpack(rgb565, offsets)
                 if bpp == 32 :
                     alpha: NDArray[np.uint8] = np.frombuffer(buffer, dtype=np.uint8, offset = self.tile_size*3, count = self.tile_size)
-                    colors = np.hstack((colors, alpha))
-                tile_data = colors.tobytes()
-            case 8 :
-                tile_data = tile_file.read()
+                    pixels = np.hstack((pixels, alpha))
+                channels = pixels.shape[1]
+                return pixels.flatten().reshape(self.tile_height, self.tile_width, channels)
             case bpp :
                 raise ValueError(f"Unexpected {bpp} bpp")
-        return tile_data
+    
+    def set_tile(self, index: int, pixels: np.ndarray) :
+        nb_channels = self.nb_channels
+        match pixels.shape :
+            case (size,) : pixels = pixels.reshape((size//nb_channels, nb_channels))
+            case (nb_px, channels) : pass
+            case (w, h, channels) : pixels = pixels.reshape((-1, channels))
+            case shape : raise ValueError(f"Unexpected array shape {shape}")
+        
+        if self.bmp_type == 0x0C :
+            raise NotImplementedError("HEP compression not implemented")
+        
+        tile_file = BytesIO()
+        bpp = self.bits_per_px
+        match bpp :
+            case 4 :
+                pixels = pixels.reshape((-1)).reshape((pixels.size // 2, 2)) # TODO check if first reshape is necessary
+                pixels = (pixels[:, 0] & 0x0F) | ((pixels[:, 1] & 0x0F) << 4)
+                tile_file.write(pixels.tobytes())
+            case 8 :
+                tile_file.write(pixels.tobytes())
+            case 24 | 32 as bpp :
+                assert self.bmp_type in [0x08, 0x0B]
+                if bpp == 32 :
+                    alpha = pixels[:, 3]
+                    pixels = pixels[:, :3]
+                buffer: np.ndarray = np_rgb565_pack(pixels)
+                rgb565: np.ndarray = buffer[:, 0]
+                offsets: np.ndarray = buffer[:, 1]
+                tile_file.write(rgb565.tobytes())
+                tile_file.write(offsets.tobytes())
+                if bpp == 32 :
+                    tile_file.write(alpha.tobytes())
+            case _ :
+                raise ValueError(f"Unexpected {bpp} bpp")
+        tile_file.seek(0)
+        self[index+1].from_file(mzx_compress(tile_file))
 
     @overload
     def img_write(self, dest: BytesWriter | str) -> None: ...
@@ -329,27 +433,23 @@ class MzpImage(MzpArchive) :
     def img_write(self, dest: None = None) -> BytesIO: ...
 
     def img_write(self, dest: str | BytesWriter | None = None) :
+        crop = self.tile_crop
+        height = self.height - self.tile_y_count * crop * 2
+        width = self.width - self.tile_x_count * crop * 2
         
-        rows = [b''] * (self.height - self.tile_y_count * self.tile_crop)
+        img_pixels = np.zeros((height, width, self.nb_channels), dtype=np.uint8)
         for y in range(self.tile_y_count) :
-            start_row = y * (self.tile_height - self.tile_crop * 2)
-            row_count =  min(self.height, start_row + self.tile_height) - start_row - self.tile_crop * 2
+            start_row = y * (self.tile_height - crop * 2)
+            row_count =  min(self.height - start_row, self.tile_height) - crop * 2
+            end_row = start_row + row_count
             for x in range(self.tile_x_count) :
                 index = self.tile_x_count * y + x
-                #print(index+1, len(self._entries)-1, end="\r")
-                tile_data = self.get_tile(index)
-                chunk_size = self.tile_width * self.bytes_per_px
-                i = self.tile_crop
-                for i in range(0, row_count) :
-                    chunk_start = (i+self.tile_crop)*chunk_size
-                    chunk = tile_data[chunk_start:chunk_start+chunk_size]
-                    cur_width = len(rows[start_row + i])
-                    px_count = min(self.width, cur_width + self.tile_width) * self.bytes_per_px - cur_width
-                    
-                    temp_row = chunk[:px_count]
-                    start = self.tile_crop * self.bytes_per_px
-                    end = len(temp_row) - self.tile_crop * self.bytes_per_px
-                    rows[start_row + i] += temp_row[start:end]
+                tile_pixels = self.get_tile(index)
+                start_col = x * (self.tile_width - crop * 2)
+                col_count = min(self.width - start_col, self.tile_width) - crop * 2
+                end_col = start_col + col_count
+                img_pixels[start_row:end_row, start_col:end_col] = \
+                    tile_pixels[crop:crop+row_count, crop:crop+col_count]
         
         match dest :
             case str() :
@@ -361,16 +461,14 @@ class MzpImage(MzpArchive) :
         # PNG SIG
         file.write(b'\x89PNG\x0D\x0A\x1A\x0A')
 
-        width = self.width - self.tile_x_count * self.tile_crop * 2
-        height = self.height - self.tile_y_count * self.tile_crop * 2
         match (self.bmp_type, self.bits_per_px) :
             case (0x01, bpp) :
                 chunk = struct.pack(">IIBB", width, height, 8, 3) + b'\0\0\0' # 8bpp (PLTE)
                 write_pngchunk_withcrc(file, b'IHDR', chunk)
                 palette = self.get_palette()
                 assert palette is not None
-                plte = palette[:, :3].tobytes()# b''.join([struct.pack('BBB', r, g, b) for (r, g, b, a) in palette])
-                trns = palette[:, 3].tobytes()# b''.join([struct.pack('B', a) for (r, g, b, a) in palette])
+                plte = palette[:, :3].tobytes()
+                trns = palette[:, 3].tobytes()
                 write_pngchunk_withcrc(file, b'PLTE', plte)
                 write_pngchunk_withcrc(file, b'tRNS', trns)
             case (0x0C, bpp) :
@@ -384,8 +482,10 @@ class MzpImage(MzpArchive) :
                 raise ValueError(f"Unexpected bmp type - bpp pair 0x{t:02X},{bpp}")
 
         # split into rows and add png filtering info (mandatory even with no filter)
-        data = b'\0'+ b'\0'.join(rows)
-        write_pngchunk_withcrc(file, b"IDAT", zlib.compress(data))
+        padded = np.hstack((
+            np.zeros((height, 1), dtype=np.uint8), # add a \x00 at the start of every row
+            img_pixels.reshape((height, -1))))
+        write_pngchunk_withcrc(file, b"IDAT", zlib.compress(padded.tobytes()))
         write_pngchunk_withcrc(file, b"IEND", b'')
         
         match dest :
@@ -396,8 +496,54 @@ class MzpImage(MzpArchive) :
             case _ :
                 pass
    
-    def img_read(self, src: str |BufferedReader | None = None) :
-        raise NotImplementedError("image injection to mzp not implemented yet")
+    def img_read(self, src: str | BytesReader | bytes) :
+        if isinstance(src, bytes) :
+            src = BytesIO(src)
+        img = Image.open(src)
+        
+        nb_channels = self.nb_channels
+        crop = self.tile_crop
+        height = self.height - self.tile_y_count * crop * 2
+        width = self.width - self.tile_x_count * crop * 2
+
+        assert img.width == width and img.height == height
+
+        match (self.bmp_type, self.bits_per_px) :
+            case (0x01, 4|8 as bpp) :
+                img = img.convert("P", palette = Image.Palette.ADAPTIVE,
+                            colors = (16 if bpp == 4 else 256))
+                palette = img.palette
+                assert palette is not None
+                self.set_palette(palette)
+            case (0x0C, bpp) : raise NotImplementedError(
+                "HEP compression not implemented")
+            case (_, 24) : img = img.convert("RGB")
+            case (_, 32) : img = img.convert("RGBA")
+            case (t, bpp) :
+                raise ValueError(f"Unexpected bmp type - bpp pair 0x{t:02X},{bpp}")
+        img_pixels = np.array(img)
+        img_pixels.shape = (height, width, nb_channels)
+        for y in range(self.tile_y_count) :
+            start_row = y * (self.tile_height - crop * 2)
+            row_count =  min(self.height - start_row, self.tile_height) - crop * 2
+            end_row = start_row + row_count
+            for x in range(self.tile_x_count) :
+                index = self.tile_x_count * y + x
+                start_col = x * (self.tile_width - crop * 2)
+                col_count = min(self.width - start_col, self.tile_width) - crop * 2
+                end_col = start_col + col_count
+                tile_pixels = np.hstack((
+                    np.zeros((row_count, crop, nb_channels), dtype = np.uint8),
+                    img_pixels[start_row:end_row, start_col:end_col],
+                    np.zeros((row_count, self.tile_width - col_count - crop, nb_channels), dtype=np.uint8)
+                ))
+                tile_pixels = np.vstack((
+                    np.zeros((crop, self.tile_width, nb_channels), dtype=np.uint8),
+                    tile_pixels,
+                    np.zeros((self.tile_height - row_count - crop, self.tile_width, nb_channels), dtype = np.uint8)
+                ))
+                self.set_tile(index, tile_pixels)
+        img.close()
 
 def write_pngchunk_withcrc(file: BytesWriter, data_type: bytes, data: bytes):
     file.write(struct.pack(">I", len(data)))
@@ -410,3 +556,5 @@ HEP (bmp_type = 0x0C) header palette :
 1 byte per tile, 0x00 / 0x01 / 0x02 (?)
 
 """
+# TODO : - test img extraction with new implementation (numpy)
+#        - implement img injection

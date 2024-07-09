@@ -37,20 +37,26 @@ class RingBuffer :
         self._file.seek(pos)
         return result
 
-
-def mzx_compress(input_file: BufferedReader, output_file: Optional[BytesIO] = None,
-                 invert_bytes: bool = False) -> BytesIO :
-    start = input_file.tell()
-    end = input_file.seek(0, 2)
-    input_file.seek(start)
-    if output_file is None :
-        output_file = BytesIO()
+@overload
+def mzx_compress(src: BytesReader, dest: BytesWriter,
+                 invert_bytes: bool = False) -> None : ...
+@overload
+def mzx_compress(src: BytesReader, dest: None = None,
+                 invert_bytes: bool = False) -> BytesIO : ...
+def mzx_compress(src: BytesReader, dest: BytesWriter | None = None,
+                 invert_bytes: bool = False) :
+    start = src.tell()
+    end = src.seek(0, 2)
+    src.seek(start)
+    match dest :
+        case None : output_file = BytesIO()
+        case _ : output_file = dest
     header = MZX_FILE_MAGIC + (end - start).to_bytes(4, 'little', signed=False)
     output_file.write(header)
-    while input_file.tell() < end :
+    while src.tell() < end :
         # Len field is 6 bits, each word is 2 bytes,
         # we can write 128 bytes per literal record
-        bytes_remaining = end - input_file.tell()
+        bytes_remaining = end - src.tell()
         bytes_to_write = min(bytes_remaining, 128)
 
         # Convert to a number of words to write.
@@ -64,14 +70,15 @@ def mzx_compress(input_file: BufferedReader, output_file: Optional[BytesIO] = No
         cmd: int = (MzxCmd.LITERAL | (words_to_write << 2)) & 0xFF
         output_file.write(cmd.to_bytes(1, 'little'))
 
-        words = input_file.read(bytes_to_write)
+        words = src.read(bytes_to_write)
 
         if invert_bytes :
             words = bytes(map(lambda byte : byte ^ 0xFF, words))
         output_file.write(words)
     output_file.seek(0)
-    input_file.seek(start)
-    return output_file
+    src.seek(start)
+    if dest is None :
+        return output_file
 
 @overload
 def mzx_decompress(src: BytesReader | str, dest: BytesRW | str,

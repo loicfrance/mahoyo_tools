@@ -53,7 +53,7 @@ def hep_extract_tile(mzp: "MzpImage", tile_index: int) :
     decomp.seek(HEP_HEADER_SIZE)
     pixels = palette[np.frombuffer(decomp.read(nb_pixels), dtype=np.uint8)]
 
-    return pixels.tobytes()
+    return pixels
 
 def insert_tile(mzp: "MzpImage", tile_index: int, src: str|BufferedReader,
                 keepPalette: bool = True) :

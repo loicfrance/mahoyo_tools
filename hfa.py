@@ -349,7 +349,9 @@ class _HfaEntry :
                 else :
                     self.data = src
             case 'mzp' :
-                raise NotImplementedError("MZP compression not implemented")
+                mzpImg = MzpImage(self.data)
+                mzpImg.img_read(src)
+                self.data = mzpImg.mzp_write()
     
 #endregion #####################################################################
 #region                            HFA ARCHIVE
