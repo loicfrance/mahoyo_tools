@@ -9,16 +9,16 @@ header : 20 bytes :
 0x18:0x1B   height
 0x1C:0x1F   ? (e.g., 02 00 00 00)
 {width*height}
-n*4 bytes : ? palette (RGBA)
+n*4 bytes : palette (RGBA)
 """
 
-from io import BufferedReader, BytesIO
 import struct
+import numpy as np
+from PIL import Image
 from typing import TYPE_CHECKING
 
-import numpy as np
-
-from .mzx import mzx_decompress
+from .utils.io import BytesReader
+from .mzx import mzx_decompress, mzx_compress
 if TYPE_CHECKING :
     from .mzp import MzpImage
 
@@ -28,6 +28,13 @@ def fix_alpha(a) :
     else :
         return np.uint8(0xFF)
 np_fix_alpha = np.vectorize(fix_alpha)
+
+def unfix_alpha(a: np.uint8) :
+    if a == 0xFF :
+        return a
+    else :
+        return np.uint8(a >> 1)
+np_unfix_alpha = np.vectorize(unfix_alpha)
 
 HEP_MAGIC = int.from_bytes(b'HEP\0', 'little')
 HEP_HEADER_SIZE = 0x20
@@ -55,7 +62,32 @@ def hep_extract_tile(mzp: "MzpImage", tile_index: int) :
 
     return pixels
 
-def insert_tile(mzp: "MzpImage", tile_index: int, src: str|BufferedReader,
-                keepPalette: bool = True) :
-    # TODO
-    pass
+def hep_insert_tile(mzp: "MzpImage", tile_index: int, pixels: np.ndarray) :
+    import imagequant
+    
+    pixels = pixels.reshape((mzp.tile_width, mzp.tile_height, 4))
+    img = Image.fromarray(pixels, "RGBA")
+
+    img = imagequant.quantize_pil_image(
+        img,
+        dithering_level=1.0,  # from 0.0 to 1.0
+        max_colors=256,       # from 1 to 256
+        min_quality=0,        # from 0 to 100
+        max_quality=100,      # from 0 to 100
+    )
+    palette = img.palette
+    pixels = np.array(img)
+    assert palette is not None
+
+    assert palette.mode == "RGBA"
+    palette = np.fromiter(palette.palette, dtype=np.uint8)
+    palette.shape = (256, 4)
+    palette = np.hstack((palette[:, :3], np_unfix_alpha(palette[:, 3:])), dtype=np.uint8)
+    
+    file = mzx_decompress(mzp[tile_index+1].to_file())
+    file.seek(HEP_HEADER_SIZE)
+    file.write(pixels.tobytes())
+    assert file.tell() == HEP_HEADER_SIZE + mzp.tile_width * mzp.tile_height
+    file.write(palette.tobytes())
+    file.seek(0)
+    mzp[tile_index+1].from_file(mzx_compress(file))

@@ -2,7 +2,8 @@
 extract and reinject files into Witch of the Holy Night (Steam)
 
 
-Requires python >= 3.10, numpy, Pillow, zlib
+Requires python >= 3.10, `numpy`, `Pillow`, `zlib`.
+`imagequant` is necessary only to inject some images
 
 ## Open `.hfa` Archive
 
@@ -65,7 +66,8 @@ The `inject()` method compresses the content of a file back to the archive
 entry.
 
 Some limitations apply, depending on the file format :
- - `mzp` images can be extracted but not injected yet;
+ - `mzp` images are reinjected almost as-is, resulting in higher file size, and
+    some images require the `imagequant` python package to be re-injected;
  - `ctd` scripts are decompressed, but are reinjected as-is, as the
     _LenZuCompressor_ compression algorithm has not yet been efficiently
     re-written (this should not impact the game);
@@ -78,17 +80,40 @@ Some limitations apply, depending on the file format :
 
 The fonts in the game are separated in multiple files and formats :
  - `mzp` images where the characters are drawn
- - `ccit` files that list all the characters and their position in the images
+ - `ccit` files that list all the characters, their position in the images and
+ their dimensions
 
 `mzp` font images can be generated properly using the `font.svg` file included
 in the repository. A guide to generate the images using **Inkscape** is included in
 it.
+Once the images are generated, inject them in the game files using the script:
+```python
+from os import path
+from mahoyo_tools import hfa
+from PIL import Image
 
-`ccit` files can be generated using the `ccit.Font` class, like in the example
-below :
+game_dir = "path/to/steamapps/common/WITCH ON THE HOLY NIGHT"
+input_dir = "path/to/png/files"
+font_images = [
+    "FONT_en_H00", # page 1 of standard characters
+    "FONT_en_H01", # page 2 of standard characters
+    "FONT_en_font3_00", # font used in nz (special) chapters
+    "FONT_en_italic_00" # italic characters used in the game
+]
+# open the fonts archive
+with hfa.HfaArchive(path.join(game_dir, "data00100.hfa"), 'rw') as hfa :
+    # iterate over font file names
+    for file_name in font_images :
+        # replace the image in the archive
+        png_path = path.join(input_dir, f"{file_name}.png")
+        hfa[f"{file_name}.mzp"].inject(png_path)
+```
 
+`ccit` files can be generated using the `ccit.Font` class and injected in the
+game files using the script:
 ```python
 # { character: width }
+# max width is 73
 font = Font({
     ' ':26, '!':21, '"':27, '#':45, '$':45, '%':65, '&':52, "'":17, '(':27, ')':27, '*':33, '+':45, ',':21, '-':31,
     '.':21, '/':37, '0':43, '1':30, '2':43, '3':44, '4':44, '5':44, '6':43, '7':43, '8':43, '9':44, ':':21, ';':21,
@@ -110,3 +135,8 @@ font = Font({
 with HfaArchive(f"{path_to_game}/data00100.hfa", 'rw') as archive :
     archive["Font010000.ccit"].inject(font.to_ccit())
 ```
+Repeat this script for Font010100.ccit (italic font) and Font010200.ccit
+(nz font)
+
+If you have empty slots between characters in the font image, you must fill the
+empty slots of the ccit file with unused characters (here ❶, ❷, ..., ⓯)

@@ -10,7 +10,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from .mzx import mzx_compress, mzx_decompress
-from .hep import hep_extract_tile
+from .hep import hep_extract_tile, hep_insert_tile
 from .utils.io import BytesReader, BytesWriter, save
 
 MZP_FILE_MAGIC = b'mrgd00'
@@ -399,7 +399,8 @@ class MzpImage(MzpArchive) :
             case shape : raise ValueError(f"Unexpected array shape {shape}")
         
         if self.bmp_type == 0x0C :
-            raise NotImplementedError("HEP compression not implemented")
+           hep_insert_tile(self, index, pixels)
+           return
         
         tile_file = BytesIO()
         bpp = self.bits_per_px
@@ -515,8 +516,7 @@ class MzpImage(MzpArchive) :
                 palette = img.palette
                 assert palette is not None
                 self.set_palette(palette)
-            case (0x0C, bpp) : raise NotImplementedError(
-                "HEP compression not implemented")
+            case (0x0C, bpp) : img = img.convert("RGBA")
             case (_, 24) : img = img.convert("RGB")
             case (_, 32) : img = img.convert("RGBA")
             case (t, bpp) :
