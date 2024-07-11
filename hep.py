@@ -63,30 +63,40 @@ def hep_extract_tile(mzp: "MzpImage", tile_index: int) :
     return pixels
 
 def hep_insert_tile(mzp: "MzpImage", tile_index: int, pixels: np.ndarray) :
-    import imagequant
     
-    pixels = pixels.reshape((mzp.tile_width, mzp.tile_height, 4))
-    img = Image.fromarray(pixels, "RGBA")
+    pixels = pixels.reshape((mzp.tile_width*mzp.tile_height, 4))
+    # attempt to get palette without relying on other library
+    palette, indices = np.unique(pixels, axis=0, return_inverse=True)
+    palette_size = palette.shape[0]
+    # if palette size contains more than 256 colors, use imagequant libary to
+    # quantize the image and reduce palete size to 256
+    if palette_size > 256 :
+        import imagequant
+        pixels = pixels.reshape((mzp.tile_width, mzp.tile_height, 4))
+        img = imagequant.quantize_pil_image(
+            Image.fromarray(pixels, "RGBA"),
+            dithering_level=1.0,  # from 0.0 to 1.0
+            max_colors=256,
+            min_quality=0,        # from 0 to 100
+            max_quality=100,      # from 0 to 100
+        )
+        palette = img.palette
+        indices = np.array(img)
+        assert palette is not None
 
-    img = imagequant.quantize_pil_image(
-        img,
-        dithering_level=1.0,  # from 0.0 to 1.0
-        max_colors=256,       # from 1 to 256
-        min_quality=0,        # from 0 to 100
-        max_quality=100,      # from 0 to 100
-    )
-    palette = img.palette
-    pixels = np.array(img)
-    assert palette is not None
-
-    assert palette.mode == "RGBA"
-    palette = np.fromiter(palette.palette, dtype=np.uint8)
-    palette.shape = (256, 4)
+        assert palette.mode == "RGBA"
+        palette = np.fromiter(palette.palette, dtype=np.uint8)
+        palette.shape = (palette.size//4, 4)
+        palette_size = palette.shape[0]
+    # pad palette to 256 colors
+    if palette_size < 256 :
+        palette = np.vstack((palette, np.zeros((256 - palette_size, 4), np.uint8)))
+    # transform the alpha channel to match the archive format
     palette = np.hstack((palette[:, :3], np_unfix_alpha(palette[:, 3:])), dtype=np.uint8)
     
     file = mzx_decompress(mzp[tile_index+1].to_file())
     file.seek(HEP_HEADER_SIZE)
-    file.write(pixels.tobytes())
+    file.write(indices.tobytes())
     assert file.tell() == HEP_HEADER_SIZE + mzp.tile_width * mzp.tile_height
     file.write(palette.tobytes())
     file.seek(0)

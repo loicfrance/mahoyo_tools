@@ -3,7 +3,8 @@ extract and reinject files into Witch of the Holy Night (Steam)
 
 
 Requires python >= 3.10, `numpy`, `Pillow`, `zlib`.
-`imagequant` is necessary only to inject some images
+`imagequant` is necessary on some ciconstances to quantize some images before
+injection.
 
 ## Open `.hfa` Archive
 
@@ -67,7 +68,8 @@ entry.
 
 Some limitations apply, depending on the file format :
  - `mzp` images are reinjected almost as-is, resulting in higher file size, and
-    some images require the `imagequant` python package to be re-injected;
+    modified images may require the `imagequant` python package to be
+    re-injected;
  - `ctd` scripts are decompressed, but are reinjected as-is, as the
     _LenZuCompressor_ compression algorithm has not yet been efficiently
     re-written (this should not impact the game);
