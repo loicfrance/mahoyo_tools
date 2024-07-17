@@ -390,7 +390,7 @@ class MzpImage(MzpArchive) :
             case bpp :
                 raise ValueError(f"Unexpected {bpp} bpp")
     
-    def set_tile(self, index: int, pixels: np.ndarray) :
+    def set_tile(self, index: int, pixels: np.ndarray, compression_level) :
         nb_channels = self.nb_channels
         match pixels.shape :
             case (size,) : pixels = pixels.reshape((size//nb_channels, nb_channels))
@@ -399,7 +399,7 @@ class MzpImage(MzpArchive) :
             case shape : raise ValueError(f"Unexpected array shape {shape}")
         
         if self.bmp_type == 0x0C :
-           hep_insert_tile(self, index, pixels)
+           hep_insert_tile(self, index, pixels, compression_level)
            return
         
         tile_file = BytesIO()
@@ -426,7 +426,7 @@ class MzpImage(MzpArchive) :
             case _ :
                 raise ValueError(f"Unexpected {bpp} bpp")
         tile_file.seek(0)
-        self[index+1].from_file(mzx_compress(tile_file))
+        self[index+1].from_file(mzx_compress(tile_file, level=compression_level))
 
     @overload
     def img_write(self, dest: BytesWriter | str) -> None: ...
@@ -497,7 +497,7 @@ class MzpImage(MzpArchive) :
             case _ :
                 pass
    
-    def img_read(self, src: str | BytesReader | bytes) :
+    def img_read(self, src: str | BytesReader | bytes, compression_level: int = 0) :
         if isinstance(src, bytes) :
             src = BytesIO(src)
         img = Image.open(src)
@@ -511,7 +511,15 @@ class MzpImage(MzpArchive) :
 
         match (self.bmp_type, self.bits_per_px) :
             case (0x01, 4|8 as bpp) :
-                img = img.convert("P", palette = Image.Palette.ADAPTIVE,
+                if img.mode == "P" :
+                    # make sure palette mode is RGBA
+                    assert img.palette is not None
+                    if img.palette.mode == "RGB" :
+                        img = img.convert("RGBA").convert("P",
+                            palette = Image.Palette.ADAPTIVE,
+                            colors = (16 if bpp == 4 else 256))
+                else :
+                    img = img.convert("P", palette = Image.Palette.ADAPTIVE,
                             colors = (16 if bpp == 4 else 256))
                 palette = img.palette
                 assert palette is not None
@@ -542,7 +550,7 @@ class MzpImage(MzpArchive) :
                     tile_pixels,
                     np.zeros((self.tile_height - row_count - crop, self.tile_width, nb_channels), dtype = np.uint8)
                 ))
-                self.set_tile(index, tile_pixels)
+                self.set_tile(index, tile_pixels, compression_level)
         img.close()
 
 def write_pngchunk_withcrc(file: BytesWriter, data_type: bytes, data: bytes):

@@ -327,7 +327,7 @@ class _HfaEntry :
                 case 'mp4' | 'chs' | 'ccit' | 'hw' :
                     return self.to_file(dest)
 
-    def inject(self, src: str | BytesReader | bytes) :
+    def inject(self, src: str | BytesReader | bytes, **kwargs) :
         """Inject a new content to the entry
         
         If the source is a file path that has the same extension as the entry, \
@@ -350,7 +350,7 @@ class _HfaEntry :
                     self.data = src
             case 'mzp' :
                 mzpImg = MzpImage(self.data)
-                mzpImg.img_read(src)
+                mzpImg.img_read(src, **kwargs)
                 self.data = mzpImg.mzp_write()
     
 #endregion #####################################################################

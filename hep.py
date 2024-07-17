@@ -47,14 +47,16 @@ def hep_extract_tile(mzp: "MzpImage", tile_index: int) :
     (   magic, file_size, _, _, _, width, height, _
     ) = struct.unpack("<IIIIIIII", decomp.read(HEP_HEADER_SIZE))
     nb_pixels = width*height
-    assert magic == HEP_MAGIC
-    assert width == mzp.tile_width
-    assert height == mzp.tile_height
-    assert file_size == HEP_HEADER_SIZE + nb_pixels + HEP_PALETTE_SIZE
+    assert magic == HEP_MAGIC, f"wrong magic bytes {magic}. Expected {HEP_MAGIC}"
+    assert width == mzp.tile_width, f"wrong width {width}. Expected {mzp.tile_width}"
+    assert height == mzp.tile_height, f"wrong height {height}. Expected {mzp.tile_height}"
+    assert file_size == HEP_HEADER_SIZE + nb_pixels + HEP_PALETTE_SIZE, \
+        f"wrong file size {file_size}. Expected {HEP_HEADER_SIZE + nb_pixels + HEP_PALETTE_SIZE}"
 
     decomp.seek(HEP_HEADER_SIZE + nb_pixels)
     palette = np.frombuffer(decomp.read(HEP_PALETTE_SIZE), dtype=np.uint8)
-    assert palette.size == HEP_PALETTE_SIZE
+    assert palette.size == HEP_PALETTE_SIZE, \
+        f"not enought bytes in palette for index {tile_index}. Expected {HEP_PALETTE_SIZE}, got {palette.size}"
     palette.shape = (256, 4)
     palette = np.hstack((palette[:, :3], np_fix_alpha(palette[:, 3:])), dtype=np.uint8)
 
@@ -63,7 +65,7 @@ def hep_extract_tile(mzp: "MzpImage", tile_index: int) :
 
     return pixels
 
-def hep_insert_tile(mzp: "MzpImage", tile_index: int, pixels: np.ndarray) :
+def hep_insert_tile(mzp: "MzpImage", tile_index: int, pixels: np.ndarray, compression_level: int = 0) :
     
     pixels = pixels.reshape((mzp.tile_width, mzp.tile_height, 4))
 
@@ -84,4 +86,4 @@ def hep_insert_tile(mzp: "MzpImage", tile_index: int, pixels: np.ndarray) :
     assert file.tell() == HEP_HEADER_SIZE + mzp.tile_width * mzp.tile_height
     file.write(palette.tobytes())
     file.seek(0)
-    mzp[tile_index+1].from_file(mzx_compress(file))
+    mzp[tile_index+1].from_file(mzx_compress(file, level=compression_level))
