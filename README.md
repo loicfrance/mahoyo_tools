@@ -67,9 +67,8 @@ The `inject()` method compresses the content of a file back to the archive
 entry.
 
 Some limitations apply, depending on the file format :
- - `mzp` images are reinjected almost as-is, resulting in higher file size, and
-    modified images may require the `imagequant` python package to be
-    re-injected;
+ - `mzp` images may require the `imagequant` python package to reduce the
+    palette sizeto 256 colors before injection;
  - `ctd` scripts are decompressed, but are reinjected as-is, as the
     _LenZuCompressor_ compression algorithm has not yet been efficiently
     re-written (this should not impact the game);
@@ -77,6 +76,14 @@ Some limitations apply, depending on the file format :
     class (described below) to modify the font files;
  - `chs` files cannot be decompiled yet, and are therefore extracted and
     re-injected as-is;
+
+## MZP Image compression
+
+MZP images can be injected with no compression (resulting in a fast injection
+but a very high file size), or with higher compression. Specify the parameter
+`compression_level = 0 | 1 | 2` in the `inject` method to set the compression
+level to 0 (literal, no compression), 1 (literal + RLE) or 2 (literal + RLE +
+BACKREF). Default value is 0 (no compression)
 
 ## Modifying the fonts
 
@@ -108,7 +115,7 @@ with hfa.HfaArchive(path.join(game_dir, "data00100.hfa"), 'rw') as hfa :
     for file_name in font_images :
         # replace the image in the archive
         png_path = path.join(input_dir, f"{file_name}.png")
-        hfa[f"{file_name}.mzp"].inject(png_path)
+        hfa[f"{file_name}.mzp"].inject(png_path, compression_level = 2)
 ```
 
 `ccit` files can be generated using the `ccit.Font` class and injected in the

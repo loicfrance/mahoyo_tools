@@ -53,7 +53,7 @@ def rle_compress_length(words: np.ndarray, cursor: int, clear_count: int,
                         invert_bytes: bool) :
     
     word = words[cursor]
-    if clear_count == 0x1000 :
+    if clear_count <= 0 or clear_count == 0x1000:
         last = 0xFFFF if invert_bytes else 0x0000
     else :
         last = words[cursor-1]
@@ -107,7 +107,7 @@ def mzx_compress(src: BytesReader, dest: BytesWriter | None = None,
     if words.size % 2 == 1 :
         words = np.append(words, 0x00)
     words = words.view(dtype="<u2")
-    end = len(words)
+    end = words.size
     if level == 0 :
         cursor = 0
         while cursor < end :
@@ -119,24 +119,22 @@ def mzx_compress(src: BytesReader, dest: BytesWriter | None = None,
             output_file.write(cmd.to_bytes(1, 'little'))
             output_file.write(words[cursor:cursor+chunk_size])
             cursor += chunk_size
-    elif level == 1 :
+    else :
     
-        clear_count = 0
+        clear_count = 0x1000
         #ring_buf = RingBuffer(128, 0xFF if invert_bytes else 0x00)
         literal_start = 0
         literal_len = 0
         best_len = 0
         cursor = 0
-        while cursor < words.size :
+        while cursor < end :
             #print(f"{cursor}/{words.size}", end="\r")
             
-            if clear_count <= 0:
-                clear_count = 0x1000
             if cursor > 0 :
                 rle_len = rle_compress_length(words, cursor, clear_count, invert_bytes)
                 best_len = rle_len
 
-                if best_len < 64 :
+                if best_len < 64 and level >= 2:
                     # back-ref
                     br_dist, br_len = backref_compress_length(words, cursor)
                     if br_len > best_len :
@@ -170,37 +168,39 @@ def mzx_compress(src: BytesReader, dest: BytesWriter | None = None,
                     output_file.write(chunk.tobytes())
                     literal_start += length
                     literal_len -= length
+                    if clear_count <= 0:
+                        clear_count = 0x1000
                 if best_len == rle_len :
                     cmd = (MzxCmd.RLE | ((rle_len - 1) << 2))
                     output_file.write(cmd.to_bytes(1))
                     clear_count -= rle_len
+                    if clear_count <= 0:
+                        clear_count = 0x1000
                 elif best_len == br_len :
                     cmd = (MzxCmd.BACKREF | (br_len - 1) << 2)
                     output_file.write(cmd.to_bytes(1))
                     output_file.write(int(br_dist-1).to_bytes(1))
                     clear_count -= br_len
+                    if clear_count <= 0:
+                        clear_count = 0x1000
                 else :
                     assert False, "Should never reach this point"
                 cursor += best_len
         
-        if literal_len > 0 :
-            while literal_len > 0 :
-                length = min(literal_len, 64)
-                literal_len -= length
-                cmd = (MzxCmd.LITERAL | ((length - 1) << 2))
-                output_file.write(cmd.to_bytes(1))
-                chunk = words[literal_start:literal_start+length]
-                if invert_bytes :
-                    chunk ^= 0xFFFF
-                output_file.write(chunk.tobytes())
-                literal_start += length
-                literal_len -= length
-    else :
-        raise ValueError(f"MZX compresison level {level} not implemented")
+        while literal_len > 0 :
+            length = min(literal_len, 64)
+            cmd = (MzxCmd.LITERAL | ((length - 1) << 2))
+            output_file.write(cmd.to_bytes(1))
+            chunk = words[literal_start:literal_start+length]
+            if invert_bytes :
+                chunk ^= 0xFFFF
+            output_file.write(chunk.tobytes())
+            literal_start += length
+            literal_len -= length
 
-    output_file.seek(0)
     src.seek(start)
     if dest is None :
+        output_file.seek(0)
         return output_file
 
 @overload
