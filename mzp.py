@@ -12,6 +12,7 @@ from numpy.typing import NDArray
 from .mzx import mzx_compress, mzx_decompress
 from .hep import hep_extract_tile, hep_insert_tile
 from .utils.io import BytesReader, BytesWriter, save
+from .utils.quantize import quantize
 
 MZP_FILE_MAGIC = b'mrgd00'
 MZP_HEADER_SIZE = len(MZP_FILE_MAGIC) + 2
@@ -349,7 +350,11 @@ class MzpImage(MzpArchive) :
                 case _ :
                     raise NotImplementedError(f"Unexpected palette mode {mode}")
         else :
-            palette.shape = (palette.size, 4)
+            match palette.shape :
+                case (n, 4) : pass
+                case (n, 3) : palette = np.hstack((palette, np.full((n, 1), 0xFF, dtype=np.uint8)))
+                case (n,) : palette = palette.reshape((n//4, 4))
+        assert palette.shape[0] == palette_size
         palette = np.hstack((palette[:, :3], np_unfix_alpha(palette[:, 3:])), dtype=np.uint8)
 
         if self.bmp_depth in [0x11, 0x91] :
@@ -497,7 +502,8 @@ class MzpImage(MzpArchive) :
             case _ :
                 pass
    
-    def img_read(self, src: str | BytesReader | bytes, compression_level: int = 0) :
+    def img_read(self, src: str | BytesReader | bytes, *,
+                 compression_level: int = 0) :
         if isinstance(src, bytes) :
             src = BytesIO(src)
         img = Image.open(src)
@@ -508,28 +514,26 @@ class MzpImage(MzpArchive) :
         width = self.width - self.tile_x_count * crop * 2
 
         assert img.width == width and img.height == height
-
+        img_pixels = None
         match (self.bmp_type, self.bits_per_px) :
             case (0x01, 4|8 as bpp) :
-                if img.mode == "P" :
-                    # make sure palette mode is RGBA
-                    assert img.palette is not None
-                    if img.palette.mode == "RGB" :
-                        img = img.convert("RGBA").convert("P",
-                            palette = Image.Palette.ADAPTIVE,
-                            colors = (16 if bpp == 4 else 256))
+                if img.mode == "P" and img.palette is not None and \
+                     img.palette.mode == "RGBA":
+                    self.set_palette(img.palette)
                 else :
-                    img = img.convert("P", palette = Image.Palette.ADAPTIVE,
-                            colors = (16 if bpp == 4 else 256))
-                palette = img.palette
-                assert palette is not None
-                self.set_palette(palette)
+                    img_pixels = np.array(img.convert("RGBA"))\
+                        .reshape((img.height, img.width, 4))
+                    palette_size = 16 if bpp == 4 else 256
+                    img_pixels, palette = quantize(img_pixels, max_colors = palette_size,
+                                            priority=['numpy', 'imagequant'])
+                    self.set_palette(palette)
             case (0x0C, bpp) : img = img.convert("RGBA")
             case (_, 24) : img = img.convert("RGB")
             case (_, 32) : img = img.convert("RGBA")
             case (t, bpp) :
                 raise ValueError(f"Unexpected bmp type - bpp pair 0x{t:02X},{bpp}")
-        img_pixels = np.array(img)
+        if img_pixels is None :
+            img_pixels = np.array(img)
         img_pixels.shape = (height, width, nb_channels)
         for y in range(self.tile_y_count) :
             start_row = y * (self.tile_height - crop * 2)

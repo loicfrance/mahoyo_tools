@@ -1,29 +1,15 @@
 from importlib.util import find_spec
-from typing import cast
+from typing import Literal, cast
 import numpy as np
 
-def quantize(pixels: np.ndarray, dithering_level: float = 1,
+def _quantize_imagequant(pixels: np.ndarray, dithering_level: float = 1,
              max_colors: int = 256, min_quality: int = 0, max_quality: int = 100) :
-
-    assert 0 <= dithering_level <= 1, \
-        "dithering_level must be a float between 0.0 and 1.0"
-    assert 1 <= max_colors <= 256, \
-        "max_colors must be an integer between 1 and 256"
-    assert 0 <= min_quality <= 100, \
-        "min_quality must be an integer between 0 and 100"
-    assert 0 <= max_quality <= 100, \
-        "max_quality must be an integer between 0 and 100"
-    assert min_quality <= max_quality, \
-        "min_quality must be lower or equal to max_quality"
-    shape = pixels.shape
-    assert len(shape) == 3 and shape[2] == 4, \
-        "pixels array must have the shape (width, height, 4)"
-
-    width, height, _ = shape
-
-    # try to use imagequant if it is available
+             
+    # test if imagequant is available
     if find_spec("imagequant") is not None :
         import imagequant
+        
+        width, height, _ = pixels.shape
         indices, palette = imagequant.quantize_raw_rgba_bytes(
             pixels.tobytes(), width, height,
             dithering_level, max_colors,
@@ -34,7 +20,12 @@ def quantize(pixels: np.ndarray, dithering_level: float = 1,
         indices.shape = (width, height, 1)
         palette.shape = (palette.size//4, 4)
         return indices, palette
+    else :
+        return None
+
+def _quantize_numpy(pixels: np.ndarray, max_colors: int = 256) :
     
+    width, height, _ = pixels.shape
     # temporary reshape the image 3D array to a 2D array
     pixels = pixels.reshape((width * height, 4))
 
@@ -44,6 +35,16 @@ def quantize(pixels: np.ndarray, dithering_level: float = 1,
     palette_len = palette.shape[0]
     if palette_len <= max_colors :
         indices = indices.reshape((width, height, 1))
+        if max_colors <= 256 :
+            indices = indices.astype(np.uint8)
+        if palette_len < max_colors :
+            # add black pixels at the beginning of the palette (apparently important for some formats)
+            pad_size = max_colors - palette_len
+            pad = np.repeat(np.array([[0,0,0,255]], dtype=np.uint8), pad_size, axis=0)
+            palette = np.vstack((pad, palette))
+            indices += pad_size
+
+        
         return indices, palette
     
     # attempt to reduce colors by merging fully-transparent pixels
@@ -60,10 +61,42 @@ def quantize(pixels: np.ndarray, dithering_level: float = 1,
         # TODO remove duplicate colors, re-compute quantized image
         raise NotImplementedError(
             "Multiple fully-transparent pixels with different RGB values.")
-    
-    else :
+    return None
+
+def quantize(pixels: np.ndarray, dithering_level: float = 1,
+             max_colors: int = 256, min_quality: int = 0, max_quality: int = 100,
+             priority: list[Literal['imagequant', 'numpy']] = ['imagequant', 'numpy']) :
+
+    assert 0 <= dithering_level <= 1, \
+        "dithering_level must be a float between 0.0 and 1.0"
+    assert 1 <= max_colors <= 256, \
+        "max_colors must be an integer between 1 and 256"
+    assert 0 <= min_quality <= 100, \
+        "min_quality must be an integer between 0 and 100"
+    assert 0 <= max_quality <= 100, \
+        "max_quality must be an integer between 0 and 100"
+    assert min_quality <= max_quality, \
+        "min_quality must be lower or equal to max_quality"
+    shape = pixels.shape
+    assert len(shape) == 3 and shape[2] == 4, \
+        "pixels array must have the shape (width, height, 4)"
+
+    for method in priority :
+        match method :
+            case 'imagequant' :
+                result = _quantize_imagequant(pixels, dithering_level,
+                                        max_colors, min_quality, max_quality)
+            case 'numpy' :
+                result = _quantize_numpy(pixels, max_colors)
+        if result :
+            indices, palette = result
+            return indices, palette
+    if 'imagequant' in priority :
         raise ImportError(
-            "Image Quantization not implemented. install `imagequant` module")
+                "Install `imagequant` module to quantize this image")
+    else :
+        raise RuntimeError("Could not quantize image. Retry with 'imagequant' "\
+            "in `priority` argument")
     
     # otherwise, use home-made implementation of imagequant
 
