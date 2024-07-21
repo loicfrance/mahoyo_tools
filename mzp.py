@@ -21,20 +21,23 @@ MZP_DEFAULT_ALIGNMENT = 8
 
 MZP_SECTOR_SIZE = 0x800
 
-def rgb565_unpack(pq: np.uint16, offsets_byte: np.uint8) :
-    r = ((pq & 0xF800) >> 8) + (offsets_byte >> 5)
-    g = ((pq & 0x07E0) >> 3) + ((offsets_byte >> 3) & 0x03)
-    b = ((pq & 0x001F) << 3) + (offsets_byte & 0x7)
-    return np.array([r, g, b], dtype=np.uint8)
-np_rgb565_unpack = np.vectorize(rgb565_unpack)
+def rgb565_unpack(pq: NDArray[np.uint16], offsets_byte: NDArray[np.uint8]) -> NDArray[np.uint8] :
+    assert len(pq.shape) == 1 and len(offsets_byte.shape) == 1 
+    r = (((pq & 0xF800) >> 8) + (offsets_byte >> 5)).astype(np.uint8)
+    g = (((pq & 0x07E0) >> 3) + ((offsets_byte >> 3) & 0x03)).astype(np.uint8)
+    b = (((pq & 0x001F) << 3) + (offsets_byte & 0x7)).astype(np.uint8)
+    return np.transpose([r, g, b])
 
-def rgb565_pack(r: np.uint8, g: np.uint8, b: np.uint8) :
-    offset = ((r & 0x07) << 5) \
-           | ((g & 0x03) << 3) \
-           | ((b & 0x07))
-    pq = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | ((b & 0xF8) >> 3)
-    return np.array([pq, offset], dtype="<u2")
-np_rgb565_pack = np.vectorize(rgb565_pack)
+def rgb565_pack(rgb: NDArray[np.uint8]) :
+    assert len(rgb.shape) == 2 and rgb.shape[1] == 3
+    offset =(((rgb[:, 0] & 0x07) << 5) \
+           | ((rgb[:, 1] & 0x03) << 3) \
+           | ((rgb[:, 2] & 0x07)))
+    rgb = rgb.astype(np.uint16)
+    pq = ((rgb[:, 0] & 0xF8) << 8) \
+       | ((rgb[:, 1] & 0xFC) << 3) \
+       | ((rgb[:, 1] & 0xF8) >> 3)
+    return pq, offset
 
 def fix_alpha(a: np.uint8) :
     if a & 0x80 == 0 :
@@ -386,10 +389,10 @@ class MzpImage(MzpArchive) :
                 buffer = tile_file.read()
                 rgb565 = np.frombuffer(buffer, dtype='<u2', count=self.tile_size)
                 offsets = np.frombuffer(buffer, dtype=np.uint8, offset = self.tile_size*2, count = self.tile_size)
-                pixels: NDArray[np.uint8] = np_rgb565_unpack(rgb565, offsets)
+                pixels: NDArray[np.uint8] = rgb565_unpack(rgb565, offsets)
                 if bpp == 32 :
                     alpha: NDArray[np.uint8] = np.frombuffer(buffer, dtype=np.uint8, offset = self.tile_size*3, count = self.tile_size)
-                    pixels = np.hstack((pixels, alpha))
+                    pixels = np.column_stack((pixels, alpha))
                 channels = pixels.shape[1]
                 return pixels.flatten().reshape(self.tile_height, self.tile_width, channels)
             case bpp :
@@ -421,9 +424,7 @@ class MzpImage(MzpArchive) :
                 if bpp == 32 :
                     alpha = pixels[:, 3]
                     pixels = pixels[:, :3]
-                buffer: np.ndarray = np_rgb565_pack(pixels)
-                rgb565: np.ndarray = buffer[:, 0]
-                offsets: np.ndarray = buffer[:, 1]
+                rgb565, offsets = rgb565_pack(pixels)
                 tile_file.write(rgb565.tobytes())
                 tile_file.write(offsets.tobytes())
                 if bpp == 32 :
