@@ -87,22 +87,33 @@ def backref_compress_length(words: np.ndarray, cursor: int) :
     else :
         return (0, 0)
 
+def literal_compress(output: BytesWriter, words: np.ndarray, start: int,
+                     length: int, invert: bool) :
+
+    assert length <= 64
+    cmd = (MzxCmd.LITERAL | ((length - 1) << 2))
+    output.write(cmd.to_bytes(1))
+    chunk = words[start:start+length]
+    if invert :
+        chunk ^= 0xFFFF
+    output.write(chunk.tobytes())
+
 @overload
 def mzx_compress(src: BytesReader, dest: BytesWriter,
-                 invert_bytes: bool = False, level: int = 0) -> None : ...
+                 invert: bool = False, level: int = 0) -> None : ...
 @overload
 def mzx_compress(src: BytesReader, dest: None = None,
-                 invert_bytes: bool = False, level: int = 0) -> BytesIO : ...
+                 invert: bool = False, level: int = 0) -> BytesIO : ...
 def mzx_compress(src: BytesReader, dest: BytesWriter | None = None,
-                 invert_bytes: bool = False, level: int = 0) :
+                 invert: bool = False, level: int = 0) :
     start = src.tell()
     end = src.seek(0, 2)
     src.seek(start)
     match dest :
-        case None : output_file = BytesIO()
-        case _ : output_file = dest
+        case None : output = BytesIO()
+        case _ : output = dest
     header = MZX_FILE_MAGIC + (end - start).to_bytes(4, 'little', signed=False)
-    output_file.write(header)
+    output.write(header)
     words = np.frombuffer(src.read(), dtype=np.uint8)
     if words.size % 2 == 1 :
         words = np.append(words, 0x00)
@@ -116,22 +127,22 @@ def mzx_compress(src: BytesReader, dest: BytesWriter | None = None,
             chunk_size = min(end - cursor, 64)
 
             cmd: int = (MzxCmd.LITERAL | ((chunk_size - 1) << 2))
-            output_file.write(cmd.to_bytes(1, 'little'))
-            output_file.write(words[cursor:cursor+chunk_size])
+            output.write(cmd.to_bytes(1, 'little'))
+            output.write(words[cursor:cursor+chunk_size])
             cursor += chunk_size
     else :
     
         clear_count = 0x1000
         #ring_buf = RingBuffer(128, 0xFF if invert_bytes else 0x00)
-        literal_start = 0
-        literal_len = 0
+        lit_start = 0
+        lit_len = 0
         best_len = 0
         cursor = 0
         while cursor < end :
             #print(f"{cursor}/{words.size}", end="\r")
             
             if cursor > 0 :
-                rle_len = rle_compress_length(words, cursor, clear_count, invert_bytes)
+                rle_len = rle_compress_length(words, cursor, clear_count, invert)
                 best_len = rle_len
 
                 if best_len < 64 and level >= 2:
@@ -143,65 +154,55 @@ def mzx_compress(src: BytesReader, dest: BytesWriter | None = None,
                 else :
                     br_len = 0
 
-
-                if literal_len > 0 and best_len == 1 : # TODO maybe <= 2 ?
+                if lit_len > 0 and best_len == 1 : # TODO maybe <= 2 ?
                     best_len = 0 # changing from literal is not worth it
             else :
                 best_len = 0
             if best_len == 0 :
                 # best is literal
-                if literal_len == 0 :
-                    literal_start = cursor
-                    literal_len = 1
-                else :
-                    literal_len += 1
+                match lit_len :
+                    case 0 :
+                        lit_start = cursor
+                        lit_len = 1
+                    case 63 :
+                        literal_compress(output, words, lit_start, 64, invert)
+                        if clear_count <= 0:
+                            clear_count = 0x1000
+                        lit_len = 0
+                    case _ :
+                        lit_len += 1
                 cursor += 1
                 clear_count -= 1
             else :
-                while literal_len > 0 :
-                    length = min(literal_len, 64)
-                    cmd = (MzxCmd.LITERAL | ((length - 1) << 2))
-                    output_file.write(cmd.to_bytes(1))
-                    chunk = words[literal_start:literal_start+length]
-                    if invert_bytes :
-                        chunk ^= 0xFFFF
-                    output_file.write(chunk.tobytes())
-                    literal_start += length
-                    literal_len -= length
+                if lit_len > 0 :
+                    literal_compress(output, words, lit_start,
+                                     lit_len, invert)
                     if clear_count <= 0:
                         clear_count = 0x1000
+                    lit_len = 0
                 if best_len == rle_len :
                     cmd = (MzxCmd.RLE | ((rle_len - 1) << 2))
-                    output_file.write(cmd.to_bytes(1))
+                    output.write(cmd.to_bytes(1))
                     clear_count -= rle_len
-                    if clear_count <= 0:
-                        clear_count = 0x1000
                 elif best_len == br_len :
                     cmd = (MzxCmd.BACKREF | (br_len - 1) << 2)
-                    output_file.write(cmd.to_bytes(1))
-                    output_file.write(int(br_dist-1).to_bytes(1))
+                    output.write(cmd.to_bytes(1))
+                    output.write(int(br_dist-1).to_bytes(1))
                     clear_count -= br_len
-                    if clear_count <= 0:
-                        clear_count = 0x1000
                 else :
                     assert False, "Should never reach this point"
+                if clear_count <= 0:
+                    clear_count = 0x1000
                 cursor += best_len
         
-        while literal_len > 0 :
-            length = min(literal_len, 64)
-            cmd = (MzxCmd.LITERAL | ((length - 1) << 2))
-            output_file.write(cmd.to_bytes(1))
-            chunk = words[literal_start:literal_start+length]
-            if invert_bytes :
-                chunk ^= 0xFFFF
-            output_file.write(chunk.tobytes())
-            literal_start += length
-            literal_len -= length
+        if lit_len > 0 :
+            literal_compress(output, words, lit_start,
+                             lit_len, invert)
 
     src.seek(start)
     if dest is None :
-        output_file.seek(0)
-        return output_file
+        output.seek(0)
+        return output
 
 @overload
 def mzx_decompress(src: BytesReader | str, dest: BytesRW | str,
