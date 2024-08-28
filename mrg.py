@@ -13,6 +13,7 @@ import struct
 from typing import BinaryIO, Iterable, Literal, overload
 
 from .lenzu import lenzu_decompress
+from .nxx import nxx_decompress
 from .mzp import MzpImage
 from .cbg import CompressedBG
 from .utils.io import BytesRW, BytesReader, BytesWriter
@@ -32,7 +33,7 @@ def readHED(path: str) :
         size = file.seek(0, 2)
         assert size % HED_ENTRY_LEN == 0, \
             f"wrong size for hed file {path}: {size}"
-        
+        file.seek(0)
         nb_entries = round(size / HED_ENTRY_LEN)
         for _ in range(0, nb_entries) :
             buffer = file.read(HED_ENTRY_LEN)
@@ -60,8 +61,12 @@ def readNAM(path: str) :
         nb_entries = round(size / NAM_ENTRY_LEN)
         for _ in range(0, nb_entries) :
             buffer = file.read(NAM_ENTRY_LEN)
-            name = buffer.decode('utf-8').strip('\r\n')
-            fileNames.append(name)
+            if buffer[-2:] == b'\r\n' :
+                name = buffer.decode('utf-8').strip('\x00\r\n')
+                fileNames.append(name)
+            else :
+                break
+    
     return fileNames
 
 def writeNAM(path: str, fileNames: Iterable[str]) :
@@ -186,8 +191,8 @@ class MrgEntry :
 
     def extract(self, dest: str | BytesRW | None = None, *args, **kwargs) :
         if self._name is not None :
-            ext = self._name[self._name.rindex('.')+1:]
-            if isinstance(dest, str) and ext == dest[dest.rfind('.')+1:] :
+            ext = self._name[self._name.rindex('.')+1:].lower()
+            if isinstance(dest, str) and dest[dest.rfind('.')+1:].lower() == ext :
                 self.to_file(dest)
                 return
         else :
@@ -208,6 +213,8 @@ class MrgEntry :
             case 'mzp' :
                 mzpImg = MzpImage(self.data)
                 return mzpImg.img_write(dest)
+            case 'nxz' :
+                return nxx_decompress(self.data, dest)
             case _ :
                 raise ValueError(f'Unimplemented extraction of {self._name}')
 
@@ -220,8 +227,8 @@ class MrgEntry :
         copied to the entry.
         """
         if self._name is not None :
-            ext = self._name[self._name.rindex('.')+1:]
-            if isinstance(src, str) and src[src.rfind('.')+1:] == ext :
+            ext = self._name[self._name.rindex('.')+1:].lower()
+            if isinstance(src, str) and src[src.rfind('.')+1:].lower() == ext :
                 self.from_file(src)
                 return
         else :
