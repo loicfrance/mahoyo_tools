@@ -2,7 +2,7 @@
 extract and reinject files into Witch of the Holy Night (Steam)
 
 
-Requires python >= 3.10, `numpy`, `Pillow`, `zlib`.
+Requires python >= 3.11, `numpy`, `Pillow`, `zlib`.
 `imagequant` is necessary on some ciconstances to quantize some images before
 injection.
 

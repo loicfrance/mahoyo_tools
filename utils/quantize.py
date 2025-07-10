@@ -1,19 +1,169 @@
 from importlib.util import find_spec
-from typing import Literal, cast
+from typing import Literal, Optional, Dict, cast
 import numpy as np
+import cffi
+
+def _quantize_libimagequant(input_data, width: int, height: int,
+    dithering_level: float = 1.0, max_colors: int = 256,
+    min_quality: int = 0, max_quality: int = 100,
+    edge_flags: Optional[Dict[str, bool]] = None) :
+
+    from imagequant._libimagequant import lib, ffi
+
+    def _get_error_msg(code) :
+        """Get error string from libimagequant return codes.
+
+        :param int code: The code returned by libimagequant.
+
+        :rtype: str
+        """
+        if code == lib.LIQ_QUALITY_TOO_LOW :
+            return "Quality too low"
+        elif code == lib.LIQ_VALUE_OUT_OF_RANGE :
+            return "Value out of range"
+        elif code == lib.LIQ_OUT_OF_MEMORY :
+            return "Out of memory"
+        elif code == lib.LIQ_ABORTED :
+            return "Aborted"
+        elif code == lib.LIQ_BITMAP_NOT_AVAILABLE :
+            return "Bitmap not available"
+        elif code == lib.LIQ_BUFFER_TOO_SMALL :
+            return "Buffer too small"
+        elif code == lib.LIQ_INVALID_POINTER :
+            return "Invalid pointer"
+        elif code == lib.LIQ_UNSUPPORTED :
+            return "Unsupported"
+        else :
+            return "Unknown error"
+
+    # Create quantization attributes
+    liq_attr = lib.liq_attr_create()
+    lib.liq_set_max_colors(liq_attr, max_colors)
+    lib.liq_set_quality(liq_attr, min_quality, max_quality)
+
+    # Create image
+    liq_image = lib.liq_image_create_rgba(liq_attr, input_data,
+                                          width, height, 0)
+    if not liq_image :
+        lib.liq_attr_destroy(liq_attr)
+        raise RuntimeError("Failed to create liq_image")
+
+    # Add a transparent black color (0, 0, 0, 0)
+    # to avoid replacing it with 71, 112, 76, 0 (hex: 47, 70, 4C, 00)
+    color = ffi.new("liq_color *", (0, 0, 0, 0))
+    code = lib.liq_image_add_fixed_color(liq_image, color[0])
+    if code != lib.LIQ_OK :
+        lib.liq_image_destroy(liq_image)
+        lib.liq_attr_destroy(liq_attr)
+        raise RuntimeError(_get_error_msg(code))
+    ffi.release(color)
+
+    # Create importance map if edge_flags is provided
+    if edge_flags is not None :
+        # Default edge_flags
+        edge_flags = edge_flags or {"left": False, "right": False,
+                                    "top": False, "bottom": False}
+
+        # Set weights:
+        # - Central zone (1 pixels inset): 255
+        # - Outer edge: 1
+        inner_weight = 255
+        outer_weight = 1
+
+        # Initialize importance map with minimal weight
+        importance_map = np.full((height, width), outer_weight, dtype=np.uint8)
+
+        # Central zone
+        importance_map[1:-1, 1:-1] = inner_weight
+
+        # Override weights for edges on image boundary
+        if edge_flags.get("left", False) :
+            importance_map[:, 0] = inner_weight  # Outer left edge
+        if edge_flags.get("right", False) :
+            importance_map[:, -1] = inner_weight  # Outer right edge
+        if edge_flags.get("top", False) :
+            importance_map[0, :] = inner_weight  # Outer top edge
+        if edge_flags.get("bottom", False) :
+            importance_map[-1, :] = inner_weight  # Outer bottom edge
+
+        # Convert importance map to contiguous C-compatible buffer
+        importance_map = np.ascontiguousarray(importance_map, dtype=np.uint8)
+        if importance_map.size != width * height :
+            lib.liq_image_destroy(liq_image)
+            lib.liq_attr_destroy(liq_attr)
+            raise ValueError(f"Importance map size {importance_map.size} "
+                                f"does not match {width * height}")
+
+        importance_buffer = ffi.from_buffer("unsigned char[]", importance_map)
+        if not importance_buffer :
+            lib.liq_image_destroy(liq_image)
+            lib.liq_attr_destroy(liq_attr)
+            raise RuntimeError("Failed to allocate importance buffer")
+
+        code = lib.liq_image_set_importance_map(liq_image, importance_buffer,
+                                                width * height,
+                                                lib.LIQ_COPY_PIXELS)
+        if code != lib.LIQ_OK :
+            lib.liq_image_destroy(liq_image)
+            lib.liq_attr_destroy(liq_attr)
+            ffi.release(importance_buffer)
+            raise RuntimeError(_get_error_msg(code))
+        ffi.release(importance_buffer)
+
+    # Quantize image
+    liq_result_p = ffi.new("liq_result**")
+    code = lib.liq_image_quantize(liq_image, liq_attr, liq_result_p)
+    if code != lib.LIQ_OK :
+        lib.liq_result_destroy(liq_result_p[0])
+        lib.liq_image_destroy(liq_image)
+        lib.liq_attr_destroy(liq_attr)
+        raise RuntimeError(_get_error_msg(code))
+
+    code = lib.liq_set_dithering_level(liq_result_p[0], dithering_level)
+    if code != lib.LIQ_OK :
+        lib.liq_result_destroy(liq_result_p[0])
+        lib.liq_image_destroy(liq_image)
+        lib.liq_attr_destroy(liq_attr)
+        raise RuntimeError(_get_error_msg(code))
+
+    raw_8bit_pixels = ffi.new("char[]", width * height)
+    code = lib.liq_write_remapped_image(
+        liq_result_p[0], liq_image, raw_8bit_pixels, width * height
+    )
+    if code != lib.LIQ_OK :
+        lib.liq_result_destroy(liq_result_p[0])
+        lib.liq_image_destroy(liq_image)
+        lib.liq_attr_destroy(liq_attr)
+        ffi.release(raw_8bit_pixels)
+        raise RuntimeError(_get_error_msg(code))
+
+    # Get palette
+    pal = lib.liq_get_palette(liq_result_p[0])
+
+    output_image_data = ffi.unpack(raw_8bit_pixels, width * height)
+    output_palette = sum([[color.r, color.g, color.b, color.a]
+                          for color in pal.entries], [])
+
+    # Cleanup
+    lib.liq_result_destroy(liq_result_p[0])
+    lib.liq_image_destroy(liq_image)
+    lib.liq_attr_destroy(liq_attr)
+    ffi.release(raw_8bit_pixels)
+
+    return output_image_data, output_palette
 
 def _quantize_imagequant(pixels: np.ndarray, dithering_level: float = 1,
-             max_colors: int = 256, min_quality: int = 0, max_quality: int = 100) :
+             max_colors: int = 256, min_quality: int = 0, max_quality: int = 100,
+             edge_flags: Optional[Dict[str, bool]] = None) :
              
     # test if imagequant is available
     if find_spec("imagequant") is not None :
-        import imagequant
         
         width, height, _ = pixels.shape
-        indices, palette = imagequant.quantize_raw_rgba_bytes(
+        indices, palette = _quantize_libimagequant(
             pixels.tobytes(), width, height,
             dithering_level, max_colors,
-            min_quality, max_quality,
+            min_quality, max_quality, edge_flags
         )
         indices = np.frombuffer(indices, dtype = np.uint8)
         palette = np.fromiter(palette, dtype = np.uint8)
@@ -65,7 +215,8 @@ def _quantize_numpy(pixels: np.ndarray, max_colors: int = 256) :
 
 def quantize(pixels: np.ndarray, dithering_level: float = 1,
              max_colors: int = 256, min_quality: int = 0, max_quality: int = 100,
-             priority: list[Literal['imagequant', 'numpy']] = ['imagequant', 'numpy']) :
+             priority: list[Literal['imagequant', 'numpy']] = ['imagequant', 'numpy'],
+             edge_flags: Optional[Dict[str, bool]] = None) :
 
     assert 0 <= dithering_level <= 1, \
         "dithering_level must be a float between 0.0 and 1.0"
@@ -85,7 +236,8 @@ def quantize(pixels: np.ndarray, dithering_level: float = 1,
         match method :
             case 'imagequant' :
                 result = _quantize_imagequant(pixels, dithering_level,
-                                        max_colors, min_quality, max_quality)
+                                              max_colors, min_quality,
+                                              max_quality, edge_flags)
             case 'numpy' :
                 result = _quantize_numpy(pixels, max_colors)
         if result :
