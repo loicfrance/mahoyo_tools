@@ -66,7 +66,18 @@ def hep_insert_tile(mzp: "MzpImage", tile_index: int, pixels: np.ndarray, compre
     
     pixels = pixels.reshape((mzp.tile_width, mzp.tile_height, 4))
 
-    indices, palette = quantize(pixels)
+    # Calculate edge_flags based on tile_index, tile_x_count, and tile_y_count
+    row = tile_index // mzp.tile_x_count
+    col = tile_index % mzp.tile_x_count
+    edge_flags = {
+        "left": col == 0,
+        "right": col == mzp.tile_x_count - 1,
+        "top": row == 0,
+        "bottom": row == mzp.tile_y_count - 1
+    }
+
+    # Quantize the tile with edge_flags
+    indices, palette = quantize(pixels, edge_flags=edge_flags)
     indices = np.uint8(indices)
     #palette = palette.astype(np.uint8)
 

@@ -37,6 +37,7 @@ class _HfaEntry :
         pos = file.tell()
         file.seek(HFA_HEADER_SIZE + index * HFA_ENTRY_HEADER_SIZE)
         self._hfa = hfa
+        self._key = None
         self._data = None
         self._file_name = file.read(0x60).rstrip(b'\0').decode('utf-8')
         self._data_offset, self._size, *self.reversed = struct.unpack("<8I", file.read(8*4))
@@ -50,6 +51,11 @@ class _HfaEntry :
     def index(self) -> int :
         """Index of the entry in the hfa file"""
         return list(self._hfa._entries.values()).index(self)
+
+    @property
+    def key(self) -> str :
+        """Key of the entry in the HfaArchive _entries dictionary"""
+        return self._key
 
     @property
     def name(self) -> str :
@@ -419,8 +425,8 @@ class HfaArchive :
         self.open()
         return self
 
-    def __exit__(self, *error) :
-        self.close()
+    def __exit__(self, exc_type, exc_value, traceback) :
+        self.close(exc_type, exc_value, traceback)
 
 #____________________________________methods____________________________________
 #- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
@@ -448,20 +454,28 @@ class HfaArchive :
         for e in entries :
             key = e._file_name
             if key in self._entries :
-                i = 2
-                while f"{key}({i})" in self._entries :
-                    i += 1
-                key = f"{key}({i})"
+                try :
+                    base, ext = key.rsplit('.', 1)
+                    i = 2
+                    while f"{base}({i}).{ext}" in self._entries :
+                        i += 1
+                    key = f"{base}({i}).{ext}" if ext else f"{base}({i})"
+                except ValueError :
+                    i = 2
+                    while f"{key}({i})" in self._entries :
+                        i += 1
+                    key = f"{key}({i})"
+            e._key = key
             self._entries[key] = e
 
-    def close(self) :
+    def close(self, exc_type = None, exc_value = None, traceback = None) :
         """Close the archive file, and clear all entries
         
         If the archive is opened in `rw` mode, the original file content is \
         replaced with the new content.
         """
         if self._file is not None :
-            if self.mode == "rw" :
+            if self.mode == "rw" and exc_type is None :
                 self.hfa_write()
             self._file.close()
             self._file = None

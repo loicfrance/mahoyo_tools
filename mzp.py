@@ -9,7 +9,7 @@ from PIL import Image, ImagePalette
 import numpy as np
 from numpy.typing import NDArray
 
-from .mzx import mzx_compress, mzx_decompress
+from .mzx import mzx_compress, mzx_decompress, MZX_FILE_MAGIC
 from .hep import hep_extract_tile, hep_insert_tile
 from .utils.io import BytesReader, BytesWriter, save
 from .utils.quantize import quantize
@@ -305,43 +305,55 @@ class MzpImage(MzpArchive) :
         else :
             return floor(bpp / 8)
 
-    def check_alpha_transparency(self, alpha):
-        min_alpha = np.min(alpha)
-        max_alpha = np.max(alpha)
+    def get_filler_index(self) -> int:
+        """
+        Extract the filler index from the last tile in the MZP archive if
+        bmp_type is 0x01.
 
-        if min_alpha == 0 and max_alpha == 0:
-            return 0x00
-        if max_alpha < 255:
-            return 0x01
-        if min_alpha == 255:
-            return 0x02
-        return 0x01
+        Returns:
+            int: The filler index, or 0 if invalid or not applicable.
 
-    def get_tile_transparency(self, pixels: np.ndarray):
-        local_palette = self.palette
-        is_palette_available = local_palette is not None and len(local_palette) > 0
+        Raises:
+            ValueError: If the last tile data is invalid or decompression fails.
+        """
+        if self.bmp_type != 0x01 :
+            return 0
 
-        # Handle 1D or single-channel cases
-        if pixels.ndim == 1 or (pixels.ndim > 1 and pixels.shape[-1] == 1):
-            indices = pixels.flatten()
-            if not is_palette_available:
-                return 0x02
+        if not self._entries :
+            raise ValueError("MZP archive is empty, cannot extract filler")
 
-            alpha = local_palette[indices, 3] if local_palette.shape[1] >= 4 else \
-                    np.full_like(indices, 255, dtype=np.uint8)
-            return self.check_alpha_transparency(alpha)
+        last_entry = self._entries[-1]
+        last_tile_compressed = last_entry.data
 
-        # Handle multi-channel cases
-        if pixels.ndim == 2 and pixels.shape[1] == 4:  # RGBA
-            return self.check_alpha_transparency(pixels[:, 3])
-        elif pixels.ndim == 3 and pixels.shape[2] == 4:  # RGBA 2D image
-            return self.check_alpha_transparency(pixels[:, :, 3].flatten())
+        # Check if data is large enough to contain MZX header
+        if len(last_tile_compressed) < len(MZX_FILE_MAGIC) + 4 :
+            raise ValueError("Last tile data too small to contain MZX header")
 
-        # RGB, Grayscale or other cases without alpha
-        if pixels.ndim in (2, 3) and pixels.shape[-1] in (1, 2, 3):
-            return 0x02
+        # Validate MZX header magic
+        header = last_tile_compressed[:len(MZX_FILE_MAGIC) + 4]
+        if header[:len(MZX_FILE_MAGIC)] != MZX_FILE_MAGIC :
+            raise ValueError("Invalid file magic in last tile")
 
-        raise ValueError(f"Unexpected pixel array shape: {pixels.shape}")
+        # Get decompressed size from header
+        decompressed_size = int.from_bytes(header[-4:], 'little', signed=False)
+
+        # Decompress the tile
+        decompressed_tile = mzx_decompress(BytesIO(last_tile_compressed))
+        decompressed_data = decompressed_tile.read()
+        if len(decompressed_data) != decompressed_size :
+            raise ValueError("Decompressed tile size mismatch: expected "
+                             f"{decompressed_size}, got {len(decompressed_data)}")
+        if not decompressed_data :
+            raise ValueError("Decompressed tile is empty")
+        filler = decompressed_data[-1]
+
+        # Validate filler index against palette size
+        if self.palette is None or filler >= len(self.palette) :
+            raise ValueError(f"Invalid filler index from last tile: {filler} "
+                              "palette size: " + (len(self.palette)
+                              if self.palette is not None else 0))
+
+        return filler
 
     def get_palette(self) :
         match (self.bmp_type, self.bmp_depth) :
@@ -388,12 +400,12 @@ class MzpImage(MzpArchive) :
                     palette.shape = (palette_size, 3)
                     if transparency :
                         alpha = np.frombuffer(transparency, dtype=np.uint8)
-                        if len(alpha) < palette_size:
+                        if len(alpha) < palette_size :
                             alpha = np.concatenate([alpha,
                                         np.full(palette_size - len(alpha),
                                         255, dtype=np.uint8)])
                         alpha.shape = (palette_size, 1)
-                    else:
+                    else :
                         alpha = np.full((palette_size, 1), 255, dtype=np.uint8)
                     palette = np.hstack((palette, alpha))
                 case "RGBA" :
@@ -403,7 +415,7 @@ class MzpImage(MzpArchive) :
                     if transparency :
                         alpha = np.full((palette.size, 1), 0, dtype=np.uint8)
                         alpha[palette == transparency] = 255
-                    else:
+                    else :
                         alpha = np.full((palette.size, 1), 255, dtype=np.uint8)
                     palette = np.hstack((palette, palette, palette, alpha))
                 case _ :
@@ -498,22 +510,34 @@ class MzpImage(MzpArchive) :
 
     def img_write(self, dest: str | BytesWriter | None = None) :
         crop = self.tile_crop
-        height = self.height - self.tile_y_count * crop * 2
-        width = self.width - self.tile_x_count * crop * 2
+        height = self.height - (self.tile_y_count - 1)  * crop * 2 + (1
+                    if self.bmp_type == 0x01 else 0)
+        width = self.width - (self.tile_x_count - 1) * crop * 2 + (1
+                    if self.bmp_type == 0x01 else 0)
         
         img_pixels = np.zeros((height, width, self.nb_channels), dtype=np.uint8)
         for y in range(self.tile_y_count) :
             start_row = y * (self.tile_height - crop * 2)
-            row_count =  min(self.height - start_row, self.tile_height) - crop * 2
-            end_row = start_row + row_count
+            start_y = crop if (crop and y > 0) else 0
+            end_y = (self.tile_height - crop) if (crop and
+                     y < self.tile_y_count - 1) else self.tile_height
+            row_count = min(height - start_row - start_y, end_y - start_y)
+
             for x in range(self.tile_x_count) :
                 index = self.tile_x_count * y + x
                 tile_pixels = self.get_tile(index)
                 start_col = x * (self.tile_width - crop * 2)
-                col_count = min(self.width - start_col, self.tile_width) - crop * 2
-                end_col = start_col + col_count
-                img_pixels[start_row:end_row, start_col:end_col] = \
-                    tile_pixels[crop:crop+row_count, crop:crop+col_count]
+                start_x = crop if (crop and x > 0) else 0
+                end_x = (self.tile_width - crop) if (crop and
+                        x < self.tile_x_count - 1) else self.tile_width
+                col_count = min(width - start_col - start_x, end_x - start_x)
+
+                img_pixels[start_row + start_y:
+                           start_row + start_y + row_count,
+                           start_col + start_x:
+                           start_col + start_x + col_count] = \
+                    tile_pixels[start_y:start_y + row_count,
+                                start_x:start_x + col_count]
         
         match dest :
             case str() :
@@ -568,17 +592,21 @@ class MzpImage(MzpArchive) :
         
         nb_channels = self.nb_channels
         crop = self.tile_crop
-        height = self.height - self.tile_y_count * crop * 2
-        width = self.width - self.tile_x_count * crop * 2
+        height = self.height - (self.tile_y_count - 1) * crop * 2 + (1
+                    if self.bmp_type == 0x01 else 0)
+        width = self.width - (self.tile_x_count - 1) * crop * 2 + (1
+                    if self.bmp_type == 0x01 else 0)
 
         assert img.width == width and img.height == height
         img_pixels = None
         self[0].data = self[0].data[0:16]
+        filler_color = 0
         match (self.bmp_type, self.bits_per_px) :
             case (0x01, 4|8 as bpp) :
                 if img.mode == "P" and img.palette is not None :
                     transparency = img.info.get('transparency')
                     self.set_palette(img.palette, transparency)
+                    filler_color = self.get_filler_index()
 
                 else :
                     img_pixels = np.array(img.convert("RGBA"))\
@@ -596,29 +624,83 @@ class MzpImage(MzpArchive) :
             img_pixels = np.array(img)
         img_pixels.shape = (height, width, nb_channels)
         for y in range(self.tile_y_count) :
-            start_row = y * (self.tile_height - crop * 2)
-            row_count =  min(self.height - start_row, self.tile_height) - crop * 2
-            end_row = start_row + row_count
+            # Calculate transparent borders
+            top_border = crop if y > 0 else 0
+            bottom_border = crop if y < self.tile_y_count - 1 else 0
+
+            # Calculate start and end rows
+            start_row = y * (self.tile_height - crop * 2) + top_border
+            inner_height = self.tile_height - top_border - bottom_border
+            end_row = min(height, start_row + inner_height)
+            row_count = end_row - start_row
+
             for x in range(self.tile_x_count) :
+                # Calculate transparent borders
+                left_border = crop if x > 0 else 0
+                right_border = crop if x < self.tile_x_count - 1 else 0
+
+                # Calculate start and end columns
                 index = self.tile_x_count * y + x
-                start_col = x * (self.tile_width - crop * 2)
-                col_count = min(self.width - start_col, self.tile_width) - crop * 2
-                end_col = start_col + col_count
+                start_col = x * (self.tile_width - crop * 2) + left_border
+                inner_width = self.tile_width - left_border - right_border
+                end_col = min(width, start_col + inner_width)
+                col_count = end_col - start_col
 
-                tile_pixels_inner = img_pixels[start_row:end_row, start_col:end_col]
-                tile_transparency = self.get_tile_transparency(tile_pixels_inner)
-                self[0].data += tile_transparency.to_bytes()
+                 # Compute transparency for inner area directly from img_pixels
+                is_palette = (nb_channels == 1 and self.palette is not None
+                              and len(self.palette) > 0)
+                inner_transparency = 0x02  # Default: no transparency
+                if row_count > 0 and col_count > 0 :
+                    if is_palette :
+                        indices = img_pixels[start_row:end_row,
+                                             start_col:end_col].flatten()
+                        if (indices.size > 0 and
+                            indices.max() < len(self.palette)) :
+                            alpha = (self.palette[indices, 3]
+                                        if self.palette.shape[1] >= 4
+                                        else np.full_like(indices, 255,
+                                                          dtype=np.uint8))
+                            min_alpha, max_alpha = np.min(alpha), np.max(alpha)
+                            if min_alpha == 0 and max_alpha == 0 :
+                                inner_transparency = 0x00
+                            elif max_alpha < 255 or min_alpha < 255 :
+                                inner_transparency = 0x01
+                    elif nb_channels == 4 :  # RGBA
+                        alpha = img_pixels[start_row:end_row,
+                                           start_col:end_col][:, :, 3].flatten()
+                        if alpha.size > 0 :
+                            min_alpha, max_alpha = np.min(alpha), np.max(alpha)
+                            if min_alpha == 0 and max_alpha == 0 :
+                                inner_transparency = 0x00
+                            elif max_alpha < 255 or min_alpha < 255 :
+                                inner_transparency = 0x01
 
-                tile_pixels = np.hstack((
-                    np.zeros((row_count, crop, nb_channels), dtype = np.uint8),
-                    tile_pixels_inner,
-                    np.zeros((row_count, self.tile_width - col_count - crop, nb_channels), dtype=np.uint8)
-                ))
-                tile_pixels = np.vstack((
-                    np.zeros((crop, self.tile_width, nb_channels), dtype=np.uint8),
-                    tile_pixels,
-                    np.zeros((self.tile_height - row_count - crop, self.tile_width, nb_channels), dtype = np.uint8)
-                ))
+                # Adjust transparency for transparent borders
+                tile_transparency = (0x01 if (crop > 0 and
+                                      inner_transparency == 0x02)
+                                      else inner_transparency)
+                self[0].data += bytes([tile_transparency])
+
+                # Initialize tile with transparent black
+                tile_pixels = np.zeros((self.tile_height, self.tile_width,
+                                        nb_channels), dtype=np.uint8)
+
+                # Copy pixels directly from image to tile, offset by borders
+                if row_count > 0 and col_count > 0:
+                    tile_pixels[top_border:top_border + row_count,
+                                left_border:left_border + col_count] = \
+                        img_pixels[start_row:end_row, start_col:end_col]
+
+                # Fill inner areas outside image bounds
+                filler = filler_color if (inner_transparency != 0x02 and
+                                          self.bmp_type == 0x01) else 0
+                if row_count < inner_height or col_count < inner_width:
+                    tile_pixels[top_border:top_border + inner_height,
+                                left_border:left_border + inner_width][
+                                row_count:, :col_count] = filler
+                    tile_pixels[top_border:top_border + inner_height,
+                                left_border:left_border + inner_width][
+                                :, col_count:] = filler
                 self.set_tile(index, tile_pixels, compression_level)
         img.close()
 
