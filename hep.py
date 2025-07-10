@@ -7,7 +7,7 @@ header : 20 bytes :
 0x10:0x13   ? (e.g., 10 00 00 00)
 0x14:0x17   width
 0x18:0x1B   height
-0x1C:0x1F   ? (e.g., 02 00 00 00)
+0x1C:0x1F   transparency (0: fully transparent, 1: partially transparent, 2: fully opaque)
 {width*height}
 n*4 bytes : palette (RGBA)
 """
@@ -41,7 +41,7 @@ HEP_PALETTE_SIZE = 0x400
 def hep_extract_tile(mzp: "MzpImage", tile_index: int) :
     decomp = mzx_decompress(mzp[tile_index+1].to_file())
 
-    (   magic, file_size, _, _, _, width, height, _
+    (   magic, file_size, _, _, _, width, height, transparency
     ) = struct.unpack("<IIIIIIII", decomp.read(HEP_HEADER_SIZE))
     nb_pixels = width*height
     assert magic == HEP_MAGIC, f"wrong magic bytes {magic}. Expected {HEP_MAGIC}"
@@ -53,7 +53,7 @@ def hep_extract_tile(mzp: "MzpImage", tile_index: int) :
     decomp.seek(HEP_HEADER_SIZE + nb_pixels)
     palette = np.frombuffer(decomp.read(HEP_PALETTE_SIZE), dtype=np.uint8)
     assert palette.size == HEP_PALETTE_SIZE, \
-        f"not enought bytes in palette for index {tile_index}. Expected {HEP_PALETTE_SIZE}, got {palette.size}"
+        f"not enough bytes in palette for index {tile_index}. Expected {HEP_PALETTE_SIZE}, got {palette.size}"
     palette.shape = (256, 4)
     palette = np.hstack((palette[:, :3], np_fix_alpha(palette[:, 3:])), dtype=np.uint8)
 
