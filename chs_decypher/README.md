@@ -1,12 +1,17 @@
 # CHS scripts decyphering
 
-This directory contains markdown files and python scripts to help decypher the
-`chs` (Compiled Hunex Script) format used by the game for its scripts,
-and _hopefully_ decompile it into its `.hss` (Hunex Script Source ?) equivalent.
+This directory contains markdown files and (yet-to-be created) python scripts
+to help decypher the `chs` (Compiled Hunex Script) format used by the game
+for its scripts, and _hopefully_ decompile it
+into its `.hss` (Hunex Script Source ?) equivalent.
 
 ## CHS file structure
 
-CHS files are made of four sections: the header, the instructions, the strings and the raw values.
+CHS files are made of four sections: the header, the instructions, the strings
+and the raw values.
+
+Strings and raw values can are addressed with their position in the file,
+minus the size of the first subsection of the header (`30h` = 48)
 
 ### Header
 
@@ -41,8 +46,16 @@ little-endian.
 Instructions are made of dword values in little endian, and have the following
 structure :
 
-It starts with the value `F7h`, then list all of its parameters,
-and finally specifies the command name.
+| Value index | Description                                            |
+|:------------|:-------------------------------------------------------|
+| 0           | `F7h`                                                  |
+| 1           | Address of the source file name in the Strings section |
+| 2           | Line number in the source file                         |
+| 3 to n-1    | Parameters                                             |
+| n           | Command name                                           |
+
+The source file name is usually the `.hss` corresponding file, but can sometime
+be some other file, such as `define_macro.h`.
 
 The parameters are coded using opcodes and values when necessary. The opcodes
 used by hunex scripts are the same as the one used by buriko scripts, which are
